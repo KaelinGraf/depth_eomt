@@ -15,8 +15,21 @@ I did not bother to freeze the backbone as some suggest, however, if you are pla
 I have provided an inference.py script. Its not perfect, but you can build on it for your requirements.
 
 ## FUTURE UPDATES
+PLEASE NOTE: As of right now, this repo is only really intended for my use, thus, the code is not up to production standard. If you intend on using
+this project in your own works, please be aware that you may have to go in and change some stuff i may have hard coded for convenience etc. 
+This will change at some point down the line if enough people find this project useful in any way.
+
 1. Monocular Depth Estimation (Unchanged Dinov3 Backbone)
 2. LoRA fine-tuning implimentation 
+3. Tidy this repo up such that it's user-friendly 
+4. Maybe a white paper if i come up with something novel during the development of 1. 
+
+## Get In Touch / About Me
+To get in touch regarding this project, the easiest way is to message me on linkedin (https://www.linkedin.com/in/kaelin-graf-ogilvie-939992319/), or via email at kaelin@iscar.co.nz 
+
+About me: I'm an undergrad mechatronics student at the University of Auckland, and I also work as head robotics developer at ISCAR Plus, an automation
+systems integrator. I have a passion for applied deep learning and robotics, and have been trying to tackle the problem of occluded specular bin picking of industrial parts for quite some time now, which this project is a part of. If you've found my work here useful, or if you have any feedback or improvements that can be made, please do get in touch as i am always keen to meet those who are passionate about the same things as myself, and i'd love to learn from those of you who have much more experience than myself as to how i can improve this project. 
+
 
 
 # Your ViT is Secretly an Image Segmentation Model  
