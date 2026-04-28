@@ -4,6 +4,9 @@ This work extends on the fantastic work from the authors of EOMT (their readme b
 Currently, there is the added provision for the occlusion prediction head, which is trained on the Iscar Bin Picking dataset. In the near future, monocular depth estimation leveraging an un-changed dinov3 unified backbone across all tasks (inspired by DepthAnything3: (https://depth-anything-3.github.io/)) will be added, however, due to the intention of use for ONLY monocular depth estimation, ray map prediction will be replaced with dense normal prediction (as well as depth estimation). 
 The intention of this work is actually for the queries to be used as conditioning for downstream diffusion tasks, hence the explicit focus on the backbone aggregating as much semantic context as possible. 
 
+You will find code relevant to the occlusion loss in mask_classification_panoptic.py, as well as mask_classification_loss.py and lightning_module.py.
+Note, use_area_weighting is a useful config option (in the loss criterion args) which changes the mask loss to be weighted by the area of the object, which is particularly useful for cases where there are lots of scale variations in your dataset.
+
 The below setup information works well, note, some variables may need to be replaced such as checkpoint paths.
 Also, partially due to laziness and partially out of not wanting to add in more duplicate code, occlusion loss implimentation has been done in mask_classification_panoptic.py.
 
