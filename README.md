@@ -1,5 +1,5 @@
 ## KAELINS README:
-**[KAELIN GRAF-OGILVIE]**
+
 This work extends on the fantastic work from the authors of EOMT (their readme below).
 Currently, there is the added provision for the occlusion prediction head, which is trained on the Iscar Bin Picking dataset. In the near future, monocular depth estimation leveraging an un-changed dinov3 unified backbone across all tasks (inspired by DepthAnything3: (https://depth-anything-3.github.io/)) will be added, however, due to the intention of use for ONLY monocular depth estimation, ray map prediction will be replaced with dense normal prediction (as well as depth estimation). 
 The intention of this work is actually for the queries to be used as conditioning for downstream diffusion tasks, hence the explicit focus on the backbone aggregating as much semantic context as possible. 
