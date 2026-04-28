@@ -24,6 +24,10 @@ class Transforms(nn.Module):
         max_contrast_factor: float = 0.5,
         saturation_factor: float = 0.5,
         max_hue_delta: int = 18,
+        sensor_noise_enabled: bool = True,
+        blur_enabled: bool = True,
+        blur_kernel_size: tuple[int, int] = (3, 7),
+        noise_variance: float = 0.05,
     ):
         super().__init__()
 
@@ -37,6 +41,12 @@ class Transforms(nn.Module):
         self.random_horizontal_flip = T.RandomHorizontalFlip()
         self.scale_jitter = T.ScaleJitter(target_size=img_size, scale_range=scale_range)
         self.random_crop = T.RandomCrop(img_size)
+
+        self.sensor_noise_enabled = sensor_noise_enabled
+        self.blur_enabled = blur_enabled
+        self.noise_variance = noise_variance
+        
+        self.gaussian_blur = T.GaussianBlur(kernel_size=blur_kernel_size, sigma=(0.1, 2.0))
 
     def _random_factor(self, factor: float, center: float = 1.0):
         return torch.empty(1).uniform_(center - factor, center + factor).item()
@@ -81,6 +91,20 @@ class Transforms(nn.Module):
 
         return img
 
+    def add_sensor_noise(self, img: Tensor) -> Tensor:
+        if not self.sensor_noise_enabled:
+            return img
+
+        if torch.rand(()) < 0.5:
+            # Add Gaussian noise approximating sensor ISO grain
+            variance = torch.rand(()) * self.noise_variance
+            # Ensure noise scaling matches image tensor scale (usually 0-255 uint8)
+            noise = torch.randn_like(img, dtype=torch.float32) * (variance * 255.0)
+            img = img.to(torch.float32) + noise
+            img = torch.clamp(img, 0, 255).to(torch.uint8)
+
+        return img
+
     def pad(
         self, img: Tensor, target: dict[str, Any]
     ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
@@ -108,6 +132,11 @@ class Transforms(nn.Module):
         img, target = self.scale_jitter(img, target)
         img, target = self.pad(img, target)
         img, target = self.random_crop(img, target)
+
+        if self.blur_enabled and torch.rand(()) < 0.25:
+            img = self.gaussian_blur(img)
+            
+        img = self.add_sensor_noise(img)
 
         valid = target["masks"].flatten(1).any(1)
         if not valid.any():

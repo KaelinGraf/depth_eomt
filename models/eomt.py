@@ -23,12 +23,14 @@ class EoMT(nn.Module):
         num_q,
         num_blocks=4,
         masked_attn_enabled=True,
+        enable_occlusion = False,
     ):
         super().__init__()
         self.encoder = encoder
         self.num_q = num_q
         self.num_blocks = num_blocks
         self.masked_attn_enabled = masked_attn_enabled
+        self.enable_occlusion = enable_occlusion
 
         self.register_buffer("attn_mask_probs", torch.ones(num_blocks))
 
@@ -43,6 +45,14 @@ class EoMT(nn.Module):
             nn.GELU(),
             nn.Linear(self.encoder.backbone.embed_dim, self.encoder.backbone.embed_dim),
         )
+        
+        self.occlusion_head = nn.Sequential(
+            nn.Linear(self.encoder.backbone.embed_dim, self.encoder.backbone.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.encoder.backbone.embed_dim, self.encoder.backbone.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.encoder.backbone.embed_dim, 1), #output single value for occlusion prediction
+        ) if enable_occlusion else None
 
         patch_size = encoder.backbone.patch_embed.patch_size
         max_patch_size = max(patch_size[0], patch_size[1])
@@ -66,7 +76,9 @@ class EoMT(nn.Module):
             "bqc, bchw -> bqhw", self.mask_head(q), self.upscale(x)
         )
 
-        return mask_logits, class_logits
+        occlusion_logits = self.occlusion_head(q).squeeze(-1) if self.enable_occlusion else None
+
+        return mask_logits, class_logits, occlusion_logits, q
 
     @torch.compiler.disable
     def _disable_attn_mask(self, attn_mask, prob):
@@ -160,7 +172,7 @@ class EoMT(nn.Module):
             x = self.encoder.backbone._pos_embed(x)
 
         attn_mask = None
-        mask_logits_per_layer, class_logits_per_layer = [], []
+        mask_logits_per_layer, class_logits_per_layer, occlusion_logits_per_layer = [], [], []
 
         for i, block in enumerate(self.encoder.backbone.blocks):
             if i == len(self.encoder.backbone.blocks) - self.num_blocks:
@@ -172,9 +184,11 @@ class EoMT(nn.Module):
                 self.masked_attn_enabled
                 and i >= len(self.encoder.backbone.blocks) - self.num_blocks
             ):
-                mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+                mask_logits, class_logits, occlusion_logits, _ = self._predict(self.encoder.backbone.norm(x))
                 mask_logits_per_layer.append(mask_logits)
                 class_logits_per_layer.append(class_logits)
+                if self.enable_occlusion:
+                    occlusion_logits_per_layer.append(occlusion_logits)
 
                 attn_mask = self._attn_mask(x, mask_logits, i)
 
@@ -194,11 +208,15 @@ class EoMT(nn.Module):
             elif hasattr(block, "layer_scale2"):
                 x = x + block.layer_scale2(mlp_out)
 
-        mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+        mask_logits, class_logits, occlusion_logits, query_tokens = self._predict(self.encoder.backbone.norm(x))
         mask_logits_per_layer.append(mask_logits)
         class_logits_per_layer.append(class_logits)
+        if self.enable_occlusion:
+            occlusion_logits_per_layer.append(occlusion_logits)
 
         return (
             mask_logits_per_layer,
             class_logits_per_layer,
+            occlusion_logits_per_layer if self.enable_occlusion else None,
+            query_tokens,  # [B, num_q, embed_dim] from final block
         )

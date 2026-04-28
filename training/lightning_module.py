@@ -92,6 +92,10 @@ class LightningModule(lightning.LightningModule):
             combined_state_dict = self._add_state_dicts(current_state_dict, ckpt)
             incompatible_keys = self.load_state_dict(combined_state_dict, strict=False)
             self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
+            # Re-initialize modules not present in checkpoint (e.g., occlusion_head)
+            # Delta weights zeroed them, and they stayed zero since they're not in the ckpt.
+            # All-zero MLPs are "dead" — gradients can't flow through zero-weight layers.
+            self._reinit_missing_modules(ckpt)
         elif ckpt_path:
             ckpt = self._load_ckpt(ckpt_path, load_ckpt_class_head)
             incompatible_keys = self.load_state_dict(ckpt, strict=False)
@@ -176,15 +180,16 @@ class LightningModule(lightning.LightningModule):
     def training_step(self, batch, batch_idx):
         imgs, targets = batch
 
-        mask_logits_per_block, class_logits_per_block = self(imgs)
+        mask_logits_per_block, class_logits_per_block, occlusion_logits_per_block, _ = self(imgs)
 
         losses_all_blocks = {}
-        for i, (mask_logits, class_logits) in enumerate(
-            list(zip(mask_logits_per_block, class_logits_per_block))
+        for i, (mask_logits, class_logits, occlusion_logits) in enumerate(
+            list(zip(mask_logits_per_block, class_logits_per_block, occlusion_logits_per_block))
         ):
             losses = self.criterion(
                 masks_queries_logits=mask_logits,
                 class_queries_logits=class_logits,
+                occlusion_queries_logits=occlusion_logits,
                 targets=targets,
             )
             block_postfix = self.block_postfix(i)
@@ -251,7 +256,7 @@ class LightningModule(lightning.LightningModule):
     def init_metrics_panoptic(self, thing_classes, stuff_classes, num_blocks):
         self.metrics = nn.ModuleList(
             [
-                PanopticQuality(
+                PanopticQualityOcclusion(
                     thing_classes,
                     stuff_classes + [self.num_classes],
                     return_sq_and_rq=True,
@@ -279,6 +284,8 @@ class LightningModule(lightning.LightningModule):
         block_idx,
     ):
         self.metrics[block_idx].update(preds, targets)
+        
+
 
     @torch.compiler.disable
     def update_metrics_panoptic(
@@ -287,6 +294,8 @@ class LightningModule(lightning.LightningModule):
         targets: list[torch.Tensor],
         is_crowds: list[torch.Tensor],
         block_idx,
+        image_segment_info: Optional[list[tuple]] = None,
+        target_occlusion_scores: Optional[list[torch.Tensor]] = None,
     ):
         for i in range(len(preds)):
             metric = self.metrics[block_idx]
@@ -631,7 +640,7 @@ class LightningModule(lightning.LightningModule):
                 else:
                     crop = resized_img[:, :, start:end]
 
-                crops.append(crop)
+                crops.append(crop.contiguous())
                 origins.append((i, start, end))
 
         return torch.stack(crops), origins
@@ -723,7 +732,7 @@ class LightningModule(lightning.LightningModule):
 
             padded_img = pad(resized_img, padding)
 
-            transformed_imgs.append(padded_img)
+            transformed_imgs.append(padded_img.contiguous())
 
         return torch.stack(transformed_imgs)
 
@@ -745,9 +754,10 @@ class LightningModule(lightning.LightningModule):
         return logits
 
     def to_per_pixel_preds_panoptic(
-        self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
+        self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh, occlusion_logits= None
     ):
         scores, classes = class_logits.softmax(dim=-1).max(-1)
+        occlusion_scores = occlusion_logits.sigmoid() if occlusion_logits is not None else None
         preds_list = []
 
         for i in range(len(mask_logits_list)):
@@ -760,8 +770,9 @@ class LightningModule(lightning.LightningModule):
 
             keep = classes[i].ne(class_logits.shape[-1] - 1) & (scores[i] > mask_thresh)
             if not keep.any():
-                preds_list.append(preds)
+                preds_list.append((preds, []))
                 continue
+            valid_occlusion = occlusion_scores is None or occlusion_scores[i][keep] #i is batch dimension index
 
             masks = mask_logits_list[i].sigmoid()
             segments = -torch.ones(
@@ -773,9 +784,10 @@ class LightningModule(lightning.LightningModule):
             mask_ids = (scores[i][keep][..., None, None] * masks[keep]).argmax(0)
             stuff_segment_ids, segment_id = {}, 0
             segment_and_class_ids = []
+            segment_occlusions = {}
 
             for k, class_id in enumerate(classes[i][keep].tolist()):
-                orig_mask = masks[keep][k] >= 0.5
+                orig_mask = masks[keep][k] >= 0.5 
                 new_mask = mask_ids == k
                 final_mask = orig_mask & new_mask
 
@@ -790,6 +802,7 @@ class LightningModule(lightning.LightningModule):
                 ):
                     continue
 
+
                 if class_id in stuff_classes:
                     if class_id in stuff_segment_ids:
                         segments[final_mask] = stuff_segment_ids[class_id]
@@ -799,15 +812,19 @@ class LightningModule(lightning.LightningModule):
 
                 segments[final_mask] = segment_id
                 segment_and_class_ids.append((segment_id, class_id))
+                if occlusion_logits is not None:
+                    segment_occlusions[segment_id] = valid_occlusion[k]
 
                 segment_id += 1
-
+            image_segment_info = []
             for segment_id, class_id in segment_and_class_ids:
                 segment_mask = segments == segment_id
                 preds[:, :, 0] = torch.where(segment_mask, class_id, preds[:, :, 0])
                 preds[:, :, 1] = torch.where(segment_mask, segment_id, preds[:, :, 1])
+                
+                image_segment_info.append((segment_id, class_id, segment_occlusions.get(segment_id, None)))
 
-            preds_list.append(preds)
+            preds_list.append((preds, image_segment_info))
 
         return preds_list
 
@@ -862,11 +879,45 @@ class LightningModule(lightning.LightningModule):
             msg += ")"
             logging.info(msg)
 
+    def _reinit_missing_modules(self, ckpt_state_dict):
+        """Re-initialize modules whose parameters were not in the checkpoint.
+
+        After delta weights loading, new modules (not in checkpoint) end up
+        all-zero. For multi-layer MLPs this creates a dead network where
+        gradients cannot flow through zero-weight layers. This method detects
+        such modules and re-applies PyTorch's default initialization.
+        """
+        ckpt_keys = set(ckpt_state_dict.keys())
+        reinit_modules = set()
+
+        for name, module in self.named_modules():
+            if not list(module.parameters(recurse=False)):
+                continue
+            # Check if ANY parameter of this leaf module was in the checkpoint
+            module_prefix = name + "."
+            has_ckpt_param = any(k.startswith(module_prefix) for k in ckpt_keys)
+            if not has_ckpt_param and name:
+                reinit_modules.add(name)
+
+        if reinit_modules:
+            with torch.no_grad():
+                count = 0
+                for name, module in self.named_modules():
+                    if name in reinit_modules:
+                        module.reset_parameters()
+                        count += sum(p.numel() for p in module.parameters(recurse=False))
+            logging.info(
+                f"Re-initialized {count:,} parameters in modules not found "
+                f"in checkpoint: {sorted(reinit_modules)}"
+            )
+
     def _add_state_dicts(self, state_dict1, state_dict2):
         summed = {}
         for k in state_dict1.keys():
             if k not in state_dict2:
-                raise KeyError(f"Key {k} not found in second state_dict")
+                print(f"Notice: {k} not found in checkpoint. Skipping delta addition.")
+                summed[k] = state_dict1[k]
+                continue
 
             if state_dict1[k].shape != state_dict2[k].shape:
                 raise ValueError(
@@ -906,3 +957,18 @@ class LightningModule(lightning.LightningModule):
                 raise ValueError(f"Missing keys: {missing_keys}")
         if incompatible_keys.unexpected_keys:
             raise ValueError(f"Unexpected keys: {incompatible_keys.unexpected_keys}")
+
+
+
+
+class PanopticQualityOcclusion(PanopticQuality):
+    def __init__(
+        self,
+        thing_classes,
+        stuff_classes,
+        return_sq_and_rq=True,
+        return_per_class=True,
+    ):
+        super().__init__(things=thing_classes, stuffs=stuff_classes, return_sq_and_rq=return_sq_and_rq, return_per_class=return_per_class)
+        self.add_state("occ_error_sum", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("occ_match_count", default=torch.tensor(0), dist_reduce_fx="sum")

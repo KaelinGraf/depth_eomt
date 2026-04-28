@@ -6,7 +6,6 @@
 # used under the Apache 2.0 License.
 # ---------------------------------------------------------------
 
-
 import jsonargparse._typehints as _t
 from types import MethodType
 from gitignore_parser import parse_gitignore

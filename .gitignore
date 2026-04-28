@@ -3,6 +3,11 @@
 _site/
 lightning_logs/
 wandb/
+checkpoints/
+data/
+dino_weights/
+scratch*
+*.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

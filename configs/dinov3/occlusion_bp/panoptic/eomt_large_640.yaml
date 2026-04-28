@@ -1,14 +1,18 @@
 trainer:
-  max_epochs: 12
+  max_epochs: 100
   logger:
     class_path: lightning.pytorch.loggers.wandb.WandbLogger
     init_args:
       resume: allow
       project: "eomt"
-      name: "coco_panoptic_eomt_large_1280_dinov3"
+      name: "iscar_bp_panoptic_eomt_large_640_dinov3"
 model:
   class_path: training.mask_classification_panoptic.MaskClassificationPanoptic
   init_args:
+    ckpt_path: "checkpoints/eomt_large_640.bin"
+    num_classes: 2
+    load_ckpt_class_head: False
+    use_area_weighting: True
     attn_mask_annealing_enabled: True
     attn_mask_annealing_start_steps: [0, 29564, 44346, 59128]
     attn_mask_annealing_end_steps: [3000, 44346, 59128, 73910]
@@ -19,12 +23,17 @@ model:
     network:
       class_path: models.eomt.EoMT
       init_args:
+        enable_occlusion: True
         num_q: 200
         encoder:
           class_path: models.vit.ViT
           init_args:
-            backbone_name: /home/kaelin/BinPicking/eomt/dino_weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+            backbone_name: facebook/dinov3-vitl16-pretrain-lvd1689m
+
 data:
-  class_path: datasets.coco_panoptic.COCOPanoptic
+  class_path: datasets.iscar_bp.ReplicatorDataModule
   init_args:
-    stuff_classes: [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132]
+    path: "/home/kaelin/BinPicking/SDG/IS/Outputs/batch_5"
+    stuff_classes: [0]
+    num_classes: 2
+    batch_size: 4

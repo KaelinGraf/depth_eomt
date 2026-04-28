@@ -216,6 +216,9 @@ class Dataset(torch.utils.data.Dataset):
         if self.transforms is not None:
             img, target = self.transforms(img, target)
 
+        if isinstance(img, torch.Tensor):
+            img = img.contiguous()
+
         return img, target
 
     def _load_zips(

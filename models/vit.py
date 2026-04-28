@@ -30,13 +30,20 @@ class ViT(nn.Module):
                 img_size,
             )
         else:
+            timm_kwargs =  {
+                "model_name": backbone_name,
+                "pretrained": ckpt_path is None, 
+                "img_size": img_size,
+                "patch_size": patch_size,
+                "num_classes": 0,
+            }
+            if ckpt_path is not None:
+                timm_kwargs["checkpoint_path"] = ckpt_path
+                timm_kwargs["pretrained"] = False
             self.backbone = timm.create_model(
-                backbone_name,
-                pretrained=ckpt_path is None,
-                img_size=img_size,
-                patch_size=patch_size,
-                num_classes=0,
+                **timm_kwargs
             )
+                
 
         pixel_mean = torch.tensor([0.485, 0.456, 0.406]).reshape(1, -1, 1, 1)
         pixel_std = torch.tensor([0.229, 0.224, 0.225]).reshape(1, -1, 1, 1)
