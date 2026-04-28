@@ -67,7 +67,7 @@ class EoMTInference:
 
     def __init__(
         self,
-        ckpt_path: str = "/home/kaelin/BinPicking/eomt/eomt/txjag5oh/checkpoints/epoch=24-step=33750.ckpt",
+        ckpt_path: str = "",
         device: str = "cuda",
         mask_thresh: float = 0.01,
         overlap_thresh: float = 0.1,

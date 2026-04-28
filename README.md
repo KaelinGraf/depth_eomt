@@ -1,3 +1,24 @@
+## KAELINS README:
+**[KAELIN GRAF-OGILVIE]**
+This work extends on the fantastic work from the authors of EOMT (their readme below).
+Currently, there is the added provision for the occlusion prediction head, which is trained on the Iscar Bin Picking dataset. In the near future, monocular depth estimation leveraging an un-changed dinov3 unified backbone across all tasks (inspired by DepthAnything3: (https://depth-anything-3.github.io/)) will be added, however, due to the intention of use for ONLY monocular depth estimation, ray map prediction will be replaced with dense normal prediction (as well as depth estimation). 
+The intention of this work is actually for the queries to be used as conditioning for downstream diffusion tasks, hence the explicit focus on the backbone aggregating as much semantic context as possible. 
+
+The below setup information works well, note, some variables may need to be replaced such as checkpoint paths.
+Also, partially due to laziness and partially out of not wanting to add in more duplicate code, occlusion loss implimentation has been done in mask_classification_panoptic.py.
+
+## TRAINING WITH DEPTH AND OCCLUSION
+I strongly reccomend simply using the DinoV3 pretrain weights as the starting point for training. This is to say, don't use the EOMT delta weights as a starting point, as they are not as good for depth estimation. If just training occlusion, delta weights seem to work fine.
+I did not bother to freeze the backbone as some suggest, however, if you are planning on running very long training schedules, it may be beneficial to freeze the backbone for the first 1000 steps or so to avoid the rich semantics collapsing, or experimenting with LoRA fine tuning on later layers.
+
+## INFERENCE
+I have provided an inference.py script. Its not perfect, but you can build on it for your requirements.
+
+## FUTURE UPDATES
+1. Monocular Depth Estimation (Unchanged Dinov3 Backbone)
+2. LoRA fine-tuning implimentation 
+
+
 # Your ViT is Secretly an Image Segmentation Model  
 **CVPR 2025 ✨ Highlight** · [📄 Paper](https://arxiv.org/abs/2503.19108)
 
