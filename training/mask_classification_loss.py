@@ -21,6 +21,8 @@ from transformers.models.mask2former.modeling_mask2former import (
     dice_loss,
 )
 
+from training.depth_loss import loss_depth_silog
+
 
 class MaskClassificationLoss(Mask2FormerLoss):
     def __init__(
@@ -34,6 +36,7 @@ class MaskClassificationLoss(Mask2FormerLoss):
         num_labels: int,
         no_object_coefficient: float,
         occlusion_coefficient: float = None,
+        depth_coefficient: float = 1.0,
         use_area_weighting: bool = False,
     ):
         nn.Module.__init__(self)
@@ -44,6 +47,7 @@ class MaskClassificationLoss(Mask2FormerLoss):
         self.dice_coefficient = dice_coefficient
         self.class_coefficient = class_coefficient
         self.occlusion_coefficient = occlusion_coefficient
+        self.depth_coefficient = depth_coefficient
         self.num_labels = num_labels
         self.eos_coef = no_object_coefficient
         self.use_area_weighting = use_area_weighting
@@ -65,12 +69,14 @@ class MaskClassificationLoss(Mask2FormerLoss):
         targets: List[dict],
         class_queries_logits: Optional[torch.Tensor] = None,
         occlusion_queries_logits: Optional[torch.Tensor] = None,
+        depth_pred: Optional[torch.Tensor] = None,
+        depth_gt: Optional[torch.Tensor] = None,
     ):
         mask_labels = [
             target["masks"].to(masks_queries_logits.dtype) for target in targets
         ]
         class_labels = [target["labels"].long() for target in targets]
-        
+
         if occlusion_queries_logits is not None:
             occlusion_labels = [target["occlusion"].float() for target in targets]
 
@@ -83,11 +89,16 @@ class MaskClassificationLoss(Mask2FormerLoss):
 
         loss_masks = self.loss_masks(masks_queries_logits, mask_labels, indices)
         loss_classes = self.loss_labels(class_queries_logits, class_labels, indices)
+
+        out = {**loss_masks, **loss_classes}
         if occlusion_queries_logits is not None:
             loss_occlusion = self.loss_occlusion(occlusion_queries_logits, occlusion_labels, indices,class_labels)
-            return {**loss_masks, **loss_classes, **loss_occlusion}
-
-        return {**loss_masks, **loss_classes}
+            out = {**out, **loss_occlusion}
+        # Depth supervision: only computed at the layer where depth_pred is
+        # passed (typically just the final layer — see depth_integration_plan §6.3).
+        if depth_pred is not None and depth_gt is not None:
+            out["loss_depth"] = loss_depth_silog(depth_pred, depth_gt)
+        return out
 
     def loss_masks(self, masks_queries_logits, mask_labels, indices):
         # Base code copied from HF Mask2FormerLoss
@@ -198,7 +209,11 @@ class MaskClassificationLoss(Mask2FormerLoss):
         for loss_key, loss in losses_all_layers.items():
             log_fn(f"losses/train_{loss_key}", loss, sync_dist=True)
 
-            if "mask" in loss_key:
+            if "depth" in loss_key:
+                # Check depth before mask: "depth" key doesn't contain "mask",
+                # but cleaner to put it first to make the precedence explicit.
+                weighted_loss = loss * self.depth_coefficient
+            elif "mask" in loss_key:
                 weighted_loss = loss * self.mask_coefficient
             elif "dice" in loss_key:
                 weighted_loss = loss * self.dice_coefficient

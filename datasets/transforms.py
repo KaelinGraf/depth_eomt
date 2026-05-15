@@ -28,6 +28,7 @@ class Transforms(nn.Module):
         blur_enabled: bool = True,
         blur_kernel_size: tuple[int, int] = (3, 7),
         noise_variance: float = 0.05,
+        hflip_prob: float = 0.5,
     ):
         super().__init__()
 
@@ -38,7 +39,9 @@ class Transforms(nn.Module):
         self.max_saturation_factor = saturation_factor
         self.max_hue_delta = max_hue_delta / 360.0
 
-        self.random_horizontal_flip = T.RandomHorizontalFlip()
+        # Flip is driven manually in forward() so the intrinsics-update path
+        # can know whether a flip actually occurred.
+        self.hflip_prob = hflip_prob
         self.scale_jitter = T.ScaleJitter(target_size=img_size, scale_range=scale_range)
         self.random_crop = T.RandomCrop(img_size)
 
@@ -114,11 +117,46 @@ class Transforms(nn.Module):
 
         img = F.pad(img, padding)
         target["masks"] = F.pad(target["masks"], padding)
+        # Pad depth with NaN — those pixels are masked out by the SI-Log
+        # validity check (`isfinite(d_gt)`), so they contribute nothing to
+        # the loss. Avoids contaminating gradients with the constant 0.
+        if "depth" in target:
+            target["depth"] = F.pad(target["depth"], padding, fill=float("nan"))
 
         return img, target
 
     def _filter(self, target: dict[str, Union[Tensor, TVTensor]], keep: Tensor) -> dict:
-        return {k: wrap(v[keep], like=v) for k, v in target.items()}
+        # `depth` and `intrinsics` are per-image (not per-instance), so the
+        # per-instance `keep` mask doesn't apply. Pass them through unchanged.
+        out = {}
+        for k, v in target.items():
+            if k in ("depth", "intrinsics"):
+                out[k] = v
+            else:
+                out[k] = wrap(v[keep], like=v)
+        return out
+
+    @staticmethod
+    def _scale_intrinsics(K: Tensor, sx: float, sy: float) -> Tensor:
+        K = K.clone()
+        K[0, 0] = K[0, 0] * sx
+        K[0, 2] = K[0, 2] * sx
+        K[1, 1] = K[1, 1] * sy
+        K[1, 2] = K[1, 2] * sy
+        return K
+
+    @staticmethod
+    def _crop_intrinsics(K: Tensor, ox: int, oy: int) -> Tensor:
+        K = K.clone()
+        K[0, 2] = K[0, 2] - ox
+        K[1, 2] = K[1, 2] - oy
+        return K
+
+    @staticmethod
+    def _hflip_intrinsics(K: Tensor, width: int) -> Tensor:
+        K = K.clone()
+        K[0, 2] = (width - 1) - K[0, 2]
+        return K
 
     def forward(
         self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
@@ -128,14 +166,50 @@ class Transforms(nn.Module):
         target = self._filter(target, ~target["is_crowd"])
 
         img = self.color_jitter(img)
-        img, target = self.random_horizontal_flip(img, target)
+
+        # Horizontal flip — done manually so we can update intrinsics.
+        if torch.rand(()) < self.hflip_prob:
+            W_before = img.shape[-1]
+            img = F.horizontal_flip(img)
+            target["masks"] = F.horizontal_flip(target["masks"])
+            if "depth" in target:
+                target["depth"] = F.horizontal_flip(target["depth"])
+            if "intrinsics" in target:
+                target["intrinsics"] = self._hflip_intrinsics(
+                    target["intrinsics"], W_before
+                )
+
+        # Scale jitter — torchvision picks the scale internally; recover sx
+        # and sy independently from the output/input shape ratios. They are
+        # nominally equal but can differ by up to ~0.2% due to integer
+        # rounding of target dims when the input is non-square.
+        W_before, H_before = img.shape[-1], img.shape[-2]
         img, target = self.scale_jitter(img, target)
+        W_after, H_after = img.shape[-1], img.shape[-2]
+        if "intrinsics" in target:
+            sx = W_after / W_before
+            sy = H_after / H_before
+            target["intrinsics"] = self._scale_intrinsics(
+                target["intrinsics"], sx, sy
+            )
+
+        # Pad — bottom-right zero pad, no change to K.
         img, target = self.pad(img, target)
-        img, target = self.random_crop(img, target)
+
+        # Random crop — pre-sample (i, j, h, w) so we can update K consistently.
+        i, j, h, w = T.RandomCrop.get_params(img, self.img_size)
+        img = F.crop(img, i, j, h, w)
+        target["masks"] = F.crop(target["masks"], i, j, h, w)
+        if "depth" in target:
+            target["depth"] = F.crop(target["depth"], i, j, h, w)
+        if "intrinsics" in target:
+            target["intrinsics"] = self._crop_intrinsics(
+                target["intrinsics"], ox=j, oy=i
+            )
 
         if self.blur_enabled and torch.rand(()) < 0.25:
             img = self.gaussian_blur(img)
-            
+
         img = self.add_sensor_noise(img)
 
         valid = target["masks"].flatten(1).any(1)

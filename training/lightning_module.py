@@ -172,25 +172,58 @@ class LightningModule(lightning.LightningModule):
             },
         }
 
-    def forward(self, imgs):
+    def forward(self, imgs, intrinsics: Optional[torch.Tensor] = None):
         x = imgs / 255.0
 
-        return self.network(x)
+        return self.network(x, intrinsics=intrinsics)
 
     def training_step(self, batch, batch_idx):
         imgs, targets = batch
 
-        mask_logits_per_block, class_logits_per_block, occlusion_logits_per_block, _ = self(imgs)
+        # Stack per-image intrinsics if present. Dataset transforms already
+        # updated K through resize/crop/flip, so it matches the post-transform
+        # image coordinates of `imgs` — no further scaling needed here.
+        intrinsics = None
+        if targets and "intrinsics" in targets[0]:
+            intrinsics = torch.stack(
+                [t["intrinsics"] for t in targets], dim=0
+            ).to(imgs.device, imgs.dtype)
+
+        (
+            mask_logits_per_block,
+            class_logits_per_block,
+            occlusion_logits_per_block,
+            depth_pred,
+            _,
+        ) = self(imgs, intrinsics=intrinsics)
+
+        # Stack the per-image depth GT once if any target carries depth.
+        # Targets without depth (e.g. legacy datasets) leave depth_gt None
+        # and the criterion skips the depth term — keeps full back-compat.
+        depth_gt = None
+        if depth_pred is not None and "depth" in targets[0]:
+            depth_gt = torch.stack(
+                [t["depth"] for t in targets], dim=0
+            ).to(depth_pred.device, depth_pred.dtype)
 
         losses_all_blocks = {}
+        last_block_idx = len(mask_logits_per_block) - 1
         for i, (mask_logits, class_logits, occlusion_logits) in enumerate(
             list(zip(mask_logits_per_block, class_logits_per_block, occlusion_logits_per_block))
         ):
+            # Depth is supervised only at the final layer (single regression
+            # output, not deep-supervised — see depth_integration_plan §6.3).
+            kw_depth = {}
+            if i == last_block_idx and depth_gt is not None:
+                kw_depth["depth_pred"] = depth_pred
+                kw_depth["depth_gt"] = depth_gt
+
             losses = self.criterion(
                 masks_queries_logits=mask_logits,
                 class_queries_logits=class_logits,
                 occlusion_queries_logits=occlusion_logits,
                 targets=targets,
+                **kw_depth,
             )
             block_postfix = self.block_postfix(i)
             losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
@@ -953,6 +986,15 @@ class LightningModule(lightning.LightningModule):
                 ]
             else:
                 missing_keys = incompatible_keys.missing_keys
+            # The DPT depth head is added on top of the EoMT model and is
+            # always trained from scratch (or initialised from DA3 weights
+            # via a separate path). The IntrinsicsMLP is likewise new and
+            # absent from pre-depth checkpoints. Old EoMT checkpoints
+            # predate both — exempt those keys from the missing-keys check.
+            missing_keys = [
+                k for k in missing_keys
+                if "depth_head" not in k and "intrinsics_mlp" not in k
+            ]
             if missing_keys:
                 raise ValueError(f"Missing keys: {missing_keys}")
         if incompatible_keys.unexpected_keys:

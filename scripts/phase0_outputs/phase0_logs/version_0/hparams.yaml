@@ -1,0 +1,51 @@
+attn_mask_annealing_enabled: true
+attn_mask_annealing_end_steps:
+- 12000
+- 177384
+- 236512
+- 295640
+attn_mask_annealing_start_steps:
+- 0
+- 118256
+- 177384
+- 236512
+batch_size: 1
+blur_enabled: true
+check_empty_targets: true
+ckpt_path: checkpoints/eomt_large_640.bin
+class_coefficient: 2.0
+color_jitter_enabled: true
+delta_weights: true
+depth_coefficient: 1.0
+dice_coefficient: 7.0
+img_size: !!python/tuple
+- 1280
+- 1280
+importance_sample_ratio: 0.55
+llrd: 0.8
+llrd_l2_enabled: false
+load_ckpt_class_head: false
+lr: 0.001
+lr_mult: 1.0
+mask_coefficient: 3.0
+mask_thresh: 0.5
+no_object_coefficient: 0.1
+num_classes: 2
+num_points: 25600
+num_workers: 4
+occlusion_coefficient: 1.0
+overlap_thresh: 0.7
+oversample_ratio: 3.0
+path: /home/kaelin/BinPicking/SDG/IS/Outputs/monocular_dataset
+poly_power: 0.9
+scale_range: !!python/tuple
+- 1.0
+- 1.0
+sensor_noise_enabled: true
+stuff_classes:
+- 0
+use_area_weighting: true
+warmup_steps:
+- 2000
+- 3000
+weight_decay: 0.05

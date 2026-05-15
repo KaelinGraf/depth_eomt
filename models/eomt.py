@@ -6,13 +6,15 @@
 # used under the Apache 2.0 License.
 # ---------------------------------------------------------------
 
-from typing import Optional
+from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
 from models.scale_block import ScaleBlock
+from models.dpt import DPT
+from models.intrinsics_mlp import IntrinsicsMLP
 
 
 class EoMT(nn.Module):
@@ -24,6 +26,10 @@ class EoMT(nn.Module):
         num_blocks=4,
         masked_attn_enabled=True,
         enable_occlusion = False,
+        # Monocular depth head (DA3 mono recipe). Pass `depth_taps=None` to
+        # disable. Default mirrors DA3's da3mono-large `out_layers`.
+        depth_taps: Optional[Sequence[int]] = (4, 11, 17, 23),
+        use_intrinsics: bool = True,
     ):
         super().__init__()
         self.encoder = encoder
@@ -31,6 +37,16 @@ class EoMT(nn.Module):
         self.num_blocks = num_blocks
         self.masked_attn_enabled = masked_attn_enabled
         self.enable_occlusion = enable_occlusion
+        self.use_intrinsics = use_intrinsics
+
+        # UniDepth-V1-style intrinsics conditioning (see CLAUDE.md). A
+        # single cam_token derived from K + image size is prepended to the
+        # ViT sequence after `_pos_embed`. Gated on `use_intrinsics`; when
+        # False the attribute is absent entirely.
+        if self.use_intrinsics:
+            self.intrinsics_mlp = IntrinsicsMLP(
+                embed_dim=self.encoder.backbone.embed_dim,
+            )
 
         self.register_buffer("attn_mask_probs", torch.ones(num_blocks))
 
@@ -45,7 +61,7 @@ class EoMT(nn.Module):
             nn.GELU(),
             nn.Linear(self.encoder.backbone.embed_dim, self.encoder.backbone.embed_dim),
         )
-        
+
         self.occlusion_head = nn.Sequential(
             nn.Linear(self.encoder.backbone.embed_dim, self.encoder.backbone.embed_dim),
             nn.GELU(),
@@ -62,12 +78,39 @@ class EoMT(nn.Module):
             *[ScaleBlock(self.encoder.backbone.embed_dim) for _ in range(num_upscale)],
         )
 
-    def _predict(self, x: torch.Tensor):
+        # Monocular depth head: DPT pyramid that consumes 4 intermediate
+        # taps from the shared backbone. Same backbone as the segmentation
+        # path so the patch embeddings encode geometry — that's the whole
+        # point for the downstream flow-matching grasp model.
+        self.depth_taps = tuple(depth_taps) if depth_taps else None
+        if self.depth_taps is not None:
+            self.depth_head = DPT(
+                dim_in=self.encoder.backbone.embed_dim,
+                patch_size=patch_size[0],
+                output_dim=1,
+                activation="exp",
+                features=256,
+                out_channels=(256, 512, 1024, 1024),
+                pos_embed=False,
+                down_ratio=1,
+                head_name="depth",
+                use_sky_head=False,
+                # Taps are pre-normed by encoder.backbone.norm in forward(),
+                # matching DA3 mono (get_intermediate_layers in DINOv2).
+                norm_type="idt",
+                fusion_block_inplace=False,
+            )
+
+    def _predict(self, x: torch.Tensor, extra_prefix: int = 0):
         q = x[:, : self.num_q, :]
 
         class_logits = self.class_head(q)
 
-        x = x[:, self.num_q + self.encoder.backbone.num_prefix_tokens :, :]
+        x = x[
+            :,
+            self.num_q + self.encoder.backbone.num_prefix_tokens + extra_prefix :,
+            :,
+        ]
         x = x.transpose(1, 2).reshape(
             x.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
         )
@@ -81,14 +124,18 @@ class EoMT(nn.Module):
         return mask_logits, class_logits, occlusion_logits, q
 
     @torch.compiler.disable
-    def _disable_attn_mask(self, attn_mask, prob):
+    def _disable_attn_mask(self, attn_mask, prob, extra_prefix: int = 0):
         if prob < 1:
             random_queries = (
                 torch.rand(attn_mask.shape[0], self.num_q, device=attn_mask.device)
                 > prob
             )
             attn_mask[
-                :, : self.num_q, self.num_q + self.encoder.backbone.num_prefix_tokens :
+                :,
+                : self.num_q,
+                self.num_q
+                + self.encoder.backbone.num_prefix_tokens
+                + extra_prefix :,
             ][random_queries] = True
 
         return attn_mask
@@ -130,7 +177,9 @@ class EoMT(nn.Module):
 
         return x
 
-    def _attn_mask(self, x: torch.Tensor, mask_logits: torch.Tensor, i: int):
+    def _attn_mask(
+        self, x: torch.Tensor, mask_logits: torch.Tensor, i: int, extra_prefix: int = 0
+    ):
         attn_mask = torch.ones(
             x.shape[0],
             x.shape[1],
@@ -147,7 +196,9 @@ class EoMT(nn.Module):
         attn_mask[
             :,
             : self.num_q,
-            self.num_q + self.encoder.backbone.num_prefix_tokens :,
+            self.num_q
+            + self.encoder.backbone.num_prefix_tokens
+            + extra_prefix :,
         ] = (
             interpolated > 0
         )
@@ -156,11 +207,21 @@ class EoMT(nn.Module):
             self.attn_mask_probs[
                 i - len(self.encoder.backbone.blocks) + self.num_blocks
             ],
+            extra_prefix=extra_prefix,
         )
         return attn_mask
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        intrinsics: Optional[torch.Tensor] = None,
+    ):
         x = (x - self.encoder.pixel_mean) / self.encoder.pixel_std
+
+        # Stash the input pixel H/W before patch_embed collapses spatial dims.
+        # IntrinsicsMLP normalises by image size, so it needs the *pixel* H/W
+        # here, not the patch-grid shape.
+        H_in, W_in = x.shape[-2], x.shape[-1]
 
         rope = None
         if hasattr(self.encoder.backbone, "rope_embeddings"):
@@ -171,26 +232,50 @@ class EoMT(nn.Module):
         if hasattr(self.encoder.backbone, "_pos_embed"):
             x = self.encoder.backbone._pos_embed(x)
 
+        # UniDepth-V1-style cam_token prepend (see CLAUDE.md). Inserted
+        # before CLS/registers so the sequence becomes
+        # [cam_token | CLS | regs | patches]. RoPE in DINOv3 applies only
+        # to the trailing `num_patches` tokens (see
+        # `transformers.../modeling_dinov3_vit.apply_rotary_pos_emb`), so
+        # the cam_token correctly receives no rotation.
+        extra_prefix = 0
+        if self.use_intrinsics and intrinsics is not None:
+            cam_token = self.intrinsics_mlp(intrinsics, image_size=(H_in, W_in))
+            x = torch.cat([cam_token, x], dim=1)
+            extra_prefix = 1
+
         attn_mask = None
         mask_logits_per_layer, class_logits_per_layer, occlusion_logits_per_layer = [], [], []
 
+        # Capture intermediate features for the depth head (DA3 recipe).
+        # Each entry will be a patch-only tensor [B, N_patch, C] taken
+        # AFTER the block executes, with prefix/query tokens sliced off.
+        depth_tap_feats = [] if self.depth_taps is not None else None
+
+        n_blocks = len(self.encoder.backbone.blocks)
+        n_prefix = self.encoder.backbone.num_prefix_tokens
+
         for i, block in enumerate(self.encoder.backbone.blocks):
-            if i == len(self.encoder.backbone.blocks) - self.num_blocks:
+            if i == n_blocks - self.num_blocks:
                 x = torch.cat(
                     (self.q.weight[None, :, :].expand(x.shape[0], -1, -1), x), dim=1
                 )
 
             if (
                 self.masked_attn_enabled
-                and i >= len(self.encoder.backbone.blocks) - self.num_blocks
+                and i >= n_blocks - self.num_blocks
             ):
-                mask_logits, class_logits, occlusion_logits, _ = self._predict(self.encoder.backbone.norm(x))
+                mask_logits, class_logits, occlusion_logits, _ = self._predict(
+                    self.encoder.backbone.norm(x), extra_prefix=extra_prefix
+                )
                 mask_logits_per_layer.append(mask_logits)
                 class_logits_per_layer.append(class_logits)
                 if self.enable_occlusion:
                     occlusion_logits_per_layer.append(occlusion_logits)
 
-                attn_mask = self._attn_mask(x, mask_logits, i)
+                attn_mask = self._attn_mask(
+                    x, mask_logits, i, extra_prefix=extra_prefix
+                )
 
             if hasattr(block, "attn"):
                 attn = block.attn
@@ -208,15 +293,58 @@ class EoMT(nn.Module):
             elif hasattr(block, "layer_scale2"):
                 x = x + block.layer_scale2(mlp_out)
 
-        mask_logits, class_logits, occlusion_logits, query_tokens = self._predict(self.encoder.backbone.norm(x))
+            # Depth tap captured AFTER the block. All four taps go through
+            # the encoder's final LayerNorm before the patch-only slice, to
+            # match DA3 mono's `get_intermediate_layers`
+            # (vision_transformer.py:384). Prefix tokens (and queries, where
+            # present) are sliced off so DPT sees patches only.
+            if depth_tap_feats is not None and i in self.depth_taps:
+                queries_present = i >= n_blocks - self.num_blocks
+                start = (
+                    (self.num_q + n_prefix + extra_prefix)
+                    if queries_present
+                    else (n_prefix + extra_prefix)
+                )
+                tap_x = self.encoder.backbone.norm(x)
+                depth_tap_feats.append(tap_x[:, start:, :].contiguous())
+
+        mask_logits, class_logits, occlusion_logits, query_tokens = self._predict(
+            self.encoder.backbone.norm(x), extra_prefix=extra_prefix
+        )
         mask_logits_per_layer.append(mask_logits)
         class_logits_per_layer.append(class_logits)
         if self.enable_occlusion:
             occlusion_logits_per_layer.append(occlusion_logits)
 
+        # Run the DPT depth head on the four captured taps. DPT expects
+        # `feats` as a list of 4 entries where `feat[0]` is a [B, S, N, C]
+        # tensor — wrap each tap in a 1-tuple so `feat[0]` returns the
+        # full [B, 1, N_patch, C] tensor.
+        depth = None
+        if depth_tap_feats is not None:
+            ph, pw = self.encoder.backbone.patch_embed.grid_size
+            patch_size = self.encoder.backbone.patch_embed.patch_size
+            H = ph * patch_size[0]
+            W = pw * patch_size[1]
+            feats_wrapped = [(t.unsqueeze(1),) for t in depth_tap_feats]  # [B, S=1, N, C]
+            depth_out = self.depth_head(
+                feats_wrapped,
+                H=H,
+                W=W,
+                patch_start_idx=0,
+                chunk_size=None,
+            )
+            depth = depth_out["depth"]  # [B, S=1, H, W] for output_dim=1
+            if depth.dim() == 4:
+                # Squeeze the trailing S=1 frame dim → [B, H, W]
+                depth = depth.squeeze(1)
+            # Return [B, 1, H, W] for uniform CHW layout downstream.
+            depth = depth.unsqueeze(1)
+
         return (
             mask_logits_per_layer,
             class_logits_per_layer,
             occlusion_logits_per_layer if self.enable_occlusion else None,
-            query_tokens,  # [B, num_q, embed_dim] from final block
+            depth,           # [B, 1, H, W] in metres (post-exp activation), or None
+            query_tokens,    # [B, num_q, embed_dim] from final block
         )

@@ -48,6 +48,7 @@ class EoMTResult:
     query_tokens: np.ndarray       # [num_q, embed_dim] for diffusion conditioning
     raw_masks: np.ndarray          # [N, H, W] per-instance binary masks
     scores: np.ndarray             # [N] confidence scores
+    depth: Optional[np.ndarray] = None  # [H, W] float32 metres, or None if depth head disabled
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +68,7 @@ class EoMTInference:
 
     def __init__(
         self,
-        ckpt_path: str = "",
+        ckpt_path: str = "/home/kaelin/BinPicking/eomt/eomt/b1k8byj1/checkpoints/epoch=23-step=32400.ckpt",
         device: str = "cuda",
         mask_thresh: float = 0.01,
         overlap_thresh: float = 0.1,
@@ -108,7 +109,7 @@ class EoMTInference:
         from models.vit import ViT
 
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        state_dict = ckpt["state_dict"]
+        state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
 
         # Extract network weights (strip 'network.' prefix from Lightning module)
         network_state = {
@@ -141,7 +142,30 @@ class EoMTInference:
 
         return model
 
-    def _preprocess(self, image: np.ndarray) -> torch.Tensor:
+    @staticmethod
+    def _intrinsics_from_scene_info(json_path) -> Optional[np.ndarray]:
+        """Pull a [3, 3] K from a Replicator scene-info JSON (cam_K, row-major).
+
+        Returns None if the file is missing/malformed so callers can fall
+        back to no-intrinsics inference on non-Replicator images.
+        """
+        import json
+
+        try:
+            with open(json_path) as f:
+                cam = json.load(f).get("camera", {})
+            cam_K = cam.get("cam_K")
+            if cam_K is not None:
+                return np.asarray(cam_K, dtype=np.float32).reshape(3, 3)
+        except (OSError, ValueError, KeyError):
+            pass
+        return None
+
+    def _preprocess(
+        self,
+        image: np.ndarray,
+        intrinsics: Optional[np.ndarray] = None,
+    ) -> torch.Tensor:
         """
         Preprocess an image for inference.
 
@@ -150,6 +174,9 @@ class EoMTInference:
 
         Args:
             image: [H, W, 3] BGR uint8 (OpenCV format).
+            intrinsics: optional [3, 3] camera matrix in *original* image
+                coordinates; will be letterbox-scaled to match the
+                preprocessed tensor and stashed on `self._scaled_intrinsics`.
 
         Returns:
             Tensor [1, 3, img_H, img_W] float32, range [0, 255].
@@ -171,6 +198,20 @@ class EoMTInference:
         # Pad to img_size (bottom-right padding with zeros)
         padded = np.zeros((*self.img_size, 3), dtype=np.uint8)
         padded[:new_h, :new_w, :] = resized
+
+        # Letterbox-scale the intrinsics into the padded canvas coordinate
+        # frame. Top-left placement → no cx/cy translation, only the resize
+        # ratio applies to fx, fy, cx, cy.
+        self._scaled_intrinsics = None
+        if intrinsics is not None:
+            K = np.asarray(intrinsics, dtype=np.float32).reshape(3, 3).copy()
+            K[0, 0] *= scale
+            K[1, 1] *= scale
+            K[0, 2] *= scale
+            K[1, 2] *= scale
+            self._scaled_intrinsics = (
+                torch.from_numpy(K).unsqueeze(0).to(self.device)
+            )
 
         # To tensor [1, 3, H, W]
         tensor = torch.from_numpy(padded).permute(2, 0, 1).unsqueeze(0).float()
@@ -289,26 +330,45 @@ class EoMTInference:
         )
 
     @torch.no_grad()
-    def __call__(self, image: Union[str, np.ndarray]) -> EoMTResult:
+    def __call__(
+        self,
+        image: Union[str, np.ndarray],
+        intrinsics: Optional[np.ndarray] = None,
+    ) -> EoMTResult:
         """
         Run inference on a single image.
 
         Args:
             image: Path to image file, or [H, W, 3] BGR numpy array.
+            intrinsics: optional [3, 3] camera intrinsics in *original*
+                image coordinates. When provided, the model's depth path
+                conditions on FOV via the intrinsics MLP. When None, the
+                model falls back to its no-intrinsics behaviour (gated by
+                `EoMT.use_intrinsics`).
 
         Returns:
             EoMTResult with panoptic segmentation + occlusion predictions.
         """
         if isinstance(image, (str, Path)):
-            image = cv2.imread(str(image))
+            img_path = Path(image)
+            # Auto-load camera intrinsics from a sibling Replicator scene-info
+            # JSON so the depth path conditions on FOV the way it did in
+            # training. Silently skipped for non-Replicator images.
+            if intrinsics is None:
+                scene_jsons = sorted(img_path.parent.glob("*scene_info*.json"))
+                if scene_jsons:
+                    intrinsics = self._intrinsics_from_scene_info(scene_jsons[0])
+            image = cv2.imread(str(img_path))
             if image is None:
-                raise FileNotFoundError(f"Could not load image: {image}")
+                raise FileNotFoundError(f"Could not load image: {img_path}")
 
-        tensor = self._preprocess(image)
+        tensor = self._preprocess(image, intrinsics=intrinsics)
+        K = getattr(self, "_scaled_intrinsics", None)
 
         # Forward pass
-        mask_logits_per_layer, class_logits_per_layer, occ_per_layer, query_tokens = self.model(
-            tensor / 255.0
+        mask_logits_per_layer, class_logits_per_layer, occ_per_layer, depth_pred, query_tokens = self.model(
+            tensor / 255.0,
+            intrinsics=K,
         )
 
         # Use final layer predictions
@@ -316,7 +376,7 @@ class EoMTInference:
         class_logits = class_logits_per_layer[-1]
         occ_logits = occ_per_layer[-1] if occ_per_layer is not None else None
 
-        # The mask outputs are downsampled, first restore them back to the padded 640x640 size
+        # The mask outputs are downsampled, first restore them back to the padded img_size
         mask_logits = F.interpolate(
             mask_logits, self.img_size, mode="bilinear", align_corners=False
         )
@@ -329,7 +389,20 @@ class EoMTInference:
             mask_logits, self._original_size, mode="bilinear", align_corners=False
         )
 
-        return self._postprocess(mask_logits, class_logits, occ_logits, query_tokens)
+        # Mirror the same letterbox-crop-resize for the depth output so it
+        # lands in the original image coordinate frame.
+        depth_np = None
+        if depth_pred is not None:
+            # depth_pred: [1, 1, H_pad, W_pad]
+            depth_pred = depth_pred[:, :, :sh, :sw]
+            depth_pred = F.interpolate(
+                depth_pred, self._original_size, mode="bilinear", align_corners=False
+            )
+            depth_np = depth_pred[0, 0].detach().cpu().numpy().astype(np.float32)
+
+        result = self._postprocess(mask_logits, class_logits, occ_logits, query_tokens)
+        result.depth = depth_np
+        return result
 
     # -----------------------------------------------------------------------
     # Visualization
@@ -357,7 +430,7 @@ class EoMTInference:
             image = cv2.imread(str(image))
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+        fig, axes = plt.subplots(1, 4, figsize=(26, 7))
 
         # --- Panel 1: Original image ---
         axes[0].imshow(image_rgb)
@@ -419,6 +492,16 @@ class EoMTInference:
         axes[2].set_title("Visibility Heatmap (green=visible, red=occluded)", fontsize=14)
         axes[2].axis("off")
 
+        # --- Panel 4: Depth heatmap ---
+        if result.depth is not None:
+            im = axes[3].imshow(result.depth, cmap="turbo")
+            axes[3].set_title("Depth (m)", fontsize=14)
+            fig.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
+        else:
+            axes[3].imshow(np.zeros(result.panoptic_mask.shape, dtype=np.uint8), cmap="gray", vmin=0, vmax=1)
+            axes[3].set_title("Depth: N/A", fontsize=14)
+        axes[3].axis("off")
+
         plt.tight_layout()
 
         if save_path:
@@ -464,10 +547,11 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, required=False, help="Path to .ckpt file")
     parser.add_argument("--save", type=str, default=None, help="Save visualization path")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--img-size", type=int, default=640, help="Model input resolution (square); match training")
     parser.add_argument("--no-show", action="store_true", help="Don't display matplotlib window")
     args = parser.parse_args()
 
-    kwargs = {"device": args.device}
+    kwargs = {"device": args.device, "img_size": (args.img_size, args.img_size)}
     if args.ckpt is not None:
         kwargs["ckpt_path"] = args.ckpt
     model = EoMTInference(**kwargs)

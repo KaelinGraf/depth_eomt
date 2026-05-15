@@ -11,15 +11,47 @@ from datasets.dataset import Dataset
 from PIL import Image
 import numpy as np
 import json
-from torchvision import tv_tensors 
+import logging
+from torchvision import tv_tensors
 
 import random
 
 CLASS_MAPPING = {
-    "background": 0, 
+    "background": 0,
     "part": 1}
 
+_intrinsics_warned = False
 
+
+def _parse_intrinsics(scene_info) -> torch.Tensor:
+    """Extract a (3, 3) float32 K matrix from the Replicator scene-info JSON.
+
+    Primary schema: ``scene_info["camera"]["cam_K"]`` row-major 9-elt list.
+    Fallback schema: ``scene_info["camera"]["fx"|"fy"|"cx"|"cy"]`` scalars.
+    If neither is present (e.g. list-shaped JSON), return identity and warn
+    once per process.
+    """
+    global _intrinsics_warned
+    cam = scene_info.get("camera") if isinstance(scene_info, dict) else None
+    if isinstance(cam, dict):
+        cam_K = cam.get("cam_K")
+        if cam_K is not None:
+            return torch.tensor(cam_K, dtype=torch.float32).reshape(3, 3)
+        fx, fy = cam.get("fx"), cam.get("fy")
+        cx, cy = cam.get("cx"), cam.get("cy")
+        if None not in (fx, fy, cx, cy):
+            return torch.tensor(
+                [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                dtype=torch.float32,
+            )
+    if not _intrinsics_warned:
+        logging.warning(
+            "ReplicatorDataset: no camera intrinsics found in scene_info; "
+            "using identity K. Downstream intrinsics-conditioned heads will "
+            "see a meaningless cam_token."
+        )
+        _intrinsics_warned = True
+    return torch.eye(3, dtype=torch.float32)
 
 
 class ReplicatorDataset(Dataset):
@@ -29,12 +61,30 @@ class ReplicatorDataset(Dataset):
     def __init__(self, data_dir: Path, transforms=None):
         self.data_dir = data_dir
         self.transforms = transforms
-        
-        # Find all frame folders recursively (e.g., batch_6/frame_0, batch_6/frame_1...)
-        self.frame_dirs = sorted([d for d in self.data_dir.rglob("frame_*") if d.is_dir()])
-        
+
+        # Find all frame folders recursively (e.g., batch_6/frame_0, ...).
+        all_dirs = sorted(d for d in self.data_dir.rglob("frame_*") if d.is_dir())
+        # Drop incomplete frames: interrupted SDG runs leave partial or empty
+        # frame_* dirs. A usable frame needs rgb + instance_raw + scene_info;
+        # filtering here keeps __len__ honest and avoids per-item retries.
+        self.frame_dirs = [d for d in all_dirs if self._is_complete(d)]
+
+        n_dropped = len(all_dirs) - len(self.frame_dirs)
+        if n_dropped:
+            logging.warning(
+                "ReplicatorDataset: skipped %d/%d incomplete frame dirs in %s",
+                n_dropped, len(all_dirs), self.data_dir,
+            )
         if len(self.frame_dirs) == 0:
-            raise RuntimeError(f"No frame directories found in {self.data_dir}")
+            raise RuntimeError(f"No complete frame directories found in {self.data_dir}")
+
+    @staticmethod
+    def _is_complete(frame_dir: Path) -> bool:
+        return (
+            (frame_dir / "rgb.png").is_file()
+            and any(frame_dir.glob("*instance_raw*"))
+            and any(frame_dir.glob("*scene_info*.json"))
+        )
 
     def __len__(self):
         return len(self.frame_dirs)
@@ -46,22 +96,41 @@ class ReplicatorDataset(Dataset):
         # 1. Load RGB Image
         img_path = frame_dir / "rgb.png"
         img = tv_tensors.Image(Image.open(img_path).convert("RGB"))
-    
-        
-        # 2. Load 16-bit Grayscale Mask
-        #raw mask paths contain the replicator number, so we need to find the file that matches the pattern
-        for file in contents:
-            if "instance_raw" in file.name and file.suffix in [".png", ".jpg", ".jpeg"]:
-                raw_mask_path = file
-                break
+
+        # 1b. Load depth (metres, float32, NaN for invalid pixels). Wrap as
+        #    tv_tensors.Mask so the spatial transforms (resize, crop, flip,
+        #    pad) treat it as a follow-the-image tensor. Mask accepts float
+        #    dtypes; if a future torchvision restricts this, swap for a
+        #    custom TVTensor subclass.
+        depth_path = frame_dir / "depth.npy"
+        depth = None
+        if depth_path.exists():
+            depth_arr = np.load(depth_path).astype(np.float32)
+            if depth_arr.ndim == 2:
+                depth_arr = depth_arr[None, ...]   # add channel dim → [1, H, W]
+            depth = tv_tensors.Mask(torch.from_numpy(depth_arr))
+
+        # 2. Load 16-bit Grayscale Mask. Raw-mask filenames carry a Replicator
+        # prefix, so match by pattern. `_is_complete` (ctor) guarantees a hit;
+        # the explicit None-check turns any future miss into a clear error
+        # instead of an UnboundLocalError.
+        raw_mask_path = next(
+            (f for f in contents
+             if "instance_raw" in f.name
+             and f.suffix.lower() in (".png", ".jpg", ".jpeg")),
+            None,
+        )
+        if raw_mask_path is None:
+            raise FileNotFoundError(f"No instance_raw image in {frame_dir}")
         raw_mask = np.array(Image.open(raw_mask_path), dtype=np.int32)
-        
+
         # 3. Load Scene Info
-        for file in contents:
-            if "scene_info" in file.name and file.suffix in [".json"]:
-                json_path = file
-                break
-        # json_path = frame_dir / "Replicator_scene_info.json"
+        json_path = next(
+            (f for f in contents if "scene_info" in f.name and f.suffix == ".json"),
+            None,
+        )
+        if json_path is None:
+            raise FileNotFoundError(f"No scene_info JSON in {frame_dir}")
         with open(json_path, "r") as f:
             scene_info = json.load(f)
             
@@ -122,7 +191,11 @@ class ReplicatorDataset(Dataset):
             "occlusion": occlusions,
             "is_crowd": is_crowd  # Required by the base collate/metric functions
         }
-        
+        if depth is not None:
+            target["depth"] = depth
+
+        target["intrinsics"] = _parse_intrinsics(scene_info)
+
         # 5. Apply the library's native Transforms
         if self.transforms is not None:
             img, target = self.transforms(img, target)
@@ -140,7 +213,7 @@ class ReplicatorDataModule(LightningDataModule):
         stuff_classes: list[int],
         num_workers: int = 4,
         batch_size: int = 16,
-        img_size: tuple[int, int] = (640, 640),
+        img_size: tuple[int, int] = (1280, 1280),
         num_classes: int = 2,
         color_jitter_enabled=False,
         sensor_noise_enabled=True,
