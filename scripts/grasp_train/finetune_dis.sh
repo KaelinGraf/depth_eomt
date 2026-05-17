@@ -4,6 +4,11 @@
 # checkpoint, and a couple of fine-tune-flavoured hyperparams differ.
 set -euo pipefail
 
+# Use bp_runtime/ros_venv — has torch 2.8 cu129 (Blackwell-ready) + hydra +
+# grasp_gen editable. The eomt conda env doesn't have hydra/h5py/meshcat etc.
+ROS_VENV=/home/kaelin/bp_runtime/ros_venv
+export PATH="${ROS_VENV}/bin:${PATH}"
+
 GRASPGEN_DIR=/home/kaelin/bp_runtime/ml_deps/GraspGen
 DATA_DIR=/home/kaelin/bp_runtime/ml_deps/eomt/grasp_finetune_data
 RESULTS_DIR=/home/kaelin/bp_runtime/ml_deps/eomt/grasp_finetune_results
@@ -21,7 +26,7 @@ mkdir -p "${LOG_DIR}" "${CACHE_DIR}"
 START_EPOCH=$(python -c "import torch, sys; \
     ck = torch.load('${PRETRAINED}', map_location='cpu', weights_only=False); \
     print(ck.get('epoch', 0))")
-TARGET_EPOCH=$((START_EPOCH + 300))
+TARGET_EPOCH=${TARGET_EPOCH_OVERRIDE:-$((START_EPOCH + 300))}
 echo "[finetune_dis] pretrained ckpt epoch=${START_EPOCH}, fine-tuning to epoch=${TARGET_EPOCH}"
 
 # Resume from local last.pth if any (mid-run continuation); otherwise from pretrained.
@@ -42,7 +47,7 @@ cd "${GRASPGEN_DIR}/scripts" && python train_graspgen.py \
     data.object_root_dir="${DATA_DIR}/object_dataset" \
     data.grasp_root_dir="${DATA_DIR}/grasp_data/${GRIPPER}" \
     data.dataset_name=iscar \
-    data.dataset_version=v1 \
+    data.dataset_version=v2 \
     data.prob_point_cloud=0.5 \
     data.redundancy=7 \
     data.gripper_name=${GRIPPER} \
