@@ -133,8 +133,13 @@ def visualize_grasps(
     *,
     n_grasps_to_draw: int = 10,
     seed: int = 0,
+    all_valid: bool = False,
 ):
-    """Render the grasps from one (frame, instance) JSON onto its RGB image."""
+    """Render the grasps from one (frame, instance) JSON onto its RGB image.
+
+    When all_valid=True, draws every valid grasp (no invalid), with thinner
+    lines + lower alpha so the per-object distribution is visible.
+    """
     with open(json_path) as f:
         d = json.load(f)
     meta = d["scene_metadata"]
@@ -143,7 +148,6 @@ def visualize_grasps(
     t = np.asarray(meta["object_pose_cam"]["t_m2c"], dtype=np.float64).reshape(3)
     T_obj2cam = np.eye(4); T_obj2cam[:3, :3] = R; T_obj2cam[:3, 3] = t
 
-    # Load RGB image from the scene_info path's parent dir
     frame_dir = Path(meta["scene_info_path"]).parent
     rgb = _load_rgb(frame_dir)
     H, W = rgb.shape[:2]
@@ -151,32 +155,43 @@ def visualize_grasps(
     transforms = np.asarray(d["grasps"]["transforms"], dtype=np.float64)
     widths = np.asarray(d["grasps"]["widths"], dtype=np.float64)
     in_gripper = d["grasps"]["object_in_gripper"]
-    reasons = d["grasps"].get("filter_reasons", [""] * len(in_gripper))
-
-    rng = np.random.default_rng(seed)
-    sel_valid, sel_invalid = _balanced_sample(in_gripper, n_grasps_to_draw, rng=rng)
     n_valid_avail = sum(in_gripper)
     n_invalid_avail = len(in_gripper) - n_valid_avail
 
     fig, ax = plt.subplots(1, 1, figsize=(7, 7))
     ax.imshow(rgb)
     drawn_v, drawn_i = 0, 0
-    for idx in sel_valid:
-        if _draw_one_grasp(ax, transforms[idx], T_obj2cam, K, "#2ECC71",
-                           width_m=float(widths[idx]), lw=1.6, image_size=(W, H)):
-            drawn_v += 1
-    for idx in sel_invalid:
-        if _draw_one_grasp(ax, transforms[idx], T_obj2cam, K, "#E74C3C",
-                           width_m=float(widths[idx]), lw=1.2, alpha=0.8, image_size=(W, H)):
-            drawn_i += 1
 
-    # Title
+    if all_valid:
+        # Thin-ish lines, moderate alpha — accumulating overlap shows density
+        # while individual grasps remain visible even on small objects.
+        lw = 1.0
+        alpha = 0.55
+        stub = 0.02
+        for idx in [i for i, v in enumerate(in_gripper) if v]:
+            if _draw_one_grasp(ax, transforms[idx], T_obj2cam, K, "#00FF66",
+                               width_m=float(widths[idx]),
+                               approach_stub_m=stub, lw=lw, alpha=alpha,
+                               image_size=(W, H)):
+                drawn_v += 1
+        title_extra = f"ALL valid: drawn green={drawn_v}/{n_valid_avail}"
+    else:
+        rng = np.random.default_rng(seed)
+        sel_valid, sel_invalid = _balanced_sample(in_gripper, n_grasps_to_draw, rng=rng)
+        for idx in sel_valid:
+            if _draw_one_grasp(ax, transforms[idx], T_obj2cam, K, "#2ECC71",
+                               width_m=float(widths[idx]), lw=1.6, image_size=(W, H)):
+                drawn_v += 1
+        for idx in sel_invalid:
+            if _draw_one_grasp(ax, transforms[idx], T_obj2cam, K, "#E74C3C",
+                               width_m=float(widths[idx]), lw=1.2, alpha=0.8, image_size=(W, H)):
+                drawn_i += 1
+        title_extra = (f"drawn green={drawn_v}/{n_valid_avail} valid · "
+                       f"red={drawn_i}/{n_invalid_avail} invalid")
+
     fid = meta["frame_id"]; inst = meta["instance_seg_id"]; obj = meta["object_name"][:40]
     vis = meta.get("object_visibility_ratio", 0.0)
-    title = (f"frame {fid} inst {inst} ({obj})\n"
-             f"vis={vis:.2f} · drawn green={drawn_v}/{n_valid_avail} valid · "
-             f"red={drawn_i}/{n_invalid_avail} invalid")
-    ax.set_title(title, fontsize=10)
+    ax.set_title(f"frame {fid} inst {inst} ({obj})\nvis={vis:.2f} · {title_extra}", fontsize=10)
     ax.set_xlim(0, W); ax.set_ylim(H, 0)
     ax.axis("off")
     plt.tight_layout()
@@ -191,11 +206,13 @@ def main():
     ap.add_argument("json_paths", nargs="+", type=Path,
                     help="One or more *.grasps.json paths")
     ap.add_argument("--out-dir", type=Path, default=Path("inference_outputs/grasp_vis"))
-    ap.add_argument("--n", type=int, default=10, help="grasps to draw per frame")
+    ap.add_argument("--n", type=int, default=10, help="grasps to draw per frame (ignored if --all-valid)")
+    ap.add_argument("--all-valid", action="store_true",
+                    help="draw every valid grasp; no invalid; thin lines so distribution is visible")
     args = ap.parse_args()
     for p in args.json_paths:
         out = args.out_dir / (p.stem + ".png")
-        visualize_grasps(p, out, n_grasps_to_draw=args.n)
+        visualize_grasps(p, out, n_grasps_to_draw=args.n, all_valid=args.all_valid)
 
 
 if __name__ == "__main__":
