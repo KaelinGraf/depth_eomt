@@ -43,25 +43,55 @@ _MESH_CACHE: dict[str, trimesh.Trimesh] = {}
 
 
 def _get_mesh_for_instance(obj: SceneObject) -> Optional[trimesh.Trimesh]:
-    """Load USD mesh for an object, rescaled per-axis to its canonical_extent.
+    """Load the asset USD mesh and scale uniformly by scale_m2c.
 
-    Returns None if USD path is missing or load failed (object will be skipped).
+    The mesh is returned in the asset's intrinsic local frame (centroid-aligned,
+    canonical orientation). The caller then places it via R_m2c/t_m2c — that
+    rotation produces the in-scene AABB which scene_info records as
+    canonical_extent. (Earlier per-axis "fit canonical_extent" was wrong: SDG's
+    canonical_extent is the post-rotation in-scene AABB, not the asset's
+    intrinsic extent, so per-axis stretching corrupted the asset's shape.)
     """
     if obj.usd_filepath is None:
         return None
     try:
         if obj.usd_filepath not in _MESH_CACHE:
             _MESH_CACHE[obj.usd_filepath] = load_usd_mesh(obj.usd_filepath, target_extent=None)
-        base = _MESH_CACHE[obj.usd_filepath]
-        m = base.copy()
-        raw_ext = np.ptp(m.bounds, axis=0)
-        safe = np.where(raw_ext > 1e-9, raw_ext, 1.0)
-        scale_per_axis = obj.canonical_extent / safe
-        m.apply_scale(scale_per_axis)
+        m = _MESH_CACHE[obj.usd_filepath].copy()
+        s = float(obj.scale_m2c) if np.isscalar(obj.scale_m2c) else float(np.mean(obj.scale_m2c))
+        m.apply_scale(s)
         return m
     except Exception as e:
         logger.warning(f"mesh load failed {obj.usd_filepath}: {e}")
         return None
+
+
+def _hollow_box_proxy(canonical_extent: np.ndarray, wall_thickness: float = 0.005) -> trimesh.Trimesh:
+    """Bin collision proxy: hollow rectangular box (floor + 4 walls) sized to
+    canonical_extent. Centroid-aligned."""
+    sx, sy, sz = float(canonical_extent[0]), float(canonical_extent[1]), float(canonical_extent[2])
+    t = wall_thickness
+    parts = []
+    floor = trimesh.creation.box((sx, sy, t))
+    floor.apply_translation((0.0, 0.0, -sz / 2 + t / 2))
+    parts.append(floor)
+    for axis, sign in [(0, 1), (0, -1), (1, 1), (1, -1)]:
+        size = [sx, sy, sz]
+        size[axis] = t
+        wall = trimesh.creation.box(tuple(size))
+        pos = [0.0, 0.0, 0.0]
+        pos[axis] = sign * (canonical_extent[axis] / 2 - t / 2)
+        wall.apply_translation(tuple(pos))
+        parts.append(wall)
+    return trimesh.util.concatenate(parts)
+
+
+def _solid_box_proxy(canonical_extent: np.ndarray) -> trimesh.Trimesh:
+    """Solid box of size canonical_extent, centroid-aligned. Used as a coarse
+    collision proxy for background objects that aren't bins (robot arm, mount,
+    fixtures). Conservative — over-rejects grasps near these objects but
+    won't under-reject."""
+    return trimesh.creation.box(tuple(float(x) for x in canonical_extent))
 
 
 def _mesh_world_pose(obj: SceneObject, mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -81,15 +111,28 @@ def _build_scene_meshes(scene: Scene) -> dict[str, trimesh.Trimesh]:
     Returns {obj_key: trimesh} where obj_key = f"seg{seg_id}__{catalog_name}".
     These will be added as named obstacles in the CollisionManager. The target
     object's key is excluded at check time.
+
+    Background objects (class=='background': bins, robot, mount, fixtures)
+    get geometric proxies sized to canonical_extent — hollow box for bins
+    (leaf 'Bin'), solid box for everything else.
     """
     out: dict[str, trimesh.Trimesh] = {}
     for obj in scene.objects:
-        m = _get_mesh_for_instance(obj)
-        if m is None or len(m.faces) == 0:
-            continue
+        if obj.obj_class == "background":
+            leaf = obj.prim_path.rsplit("/", 1)[-1] if obj.prim_path else ""
+            if leaf == "Bin":
+                m = _hollow_box_proxy(obj.canonical_extent)
+                tag = "bin_proxy"
+            else:
+                m = _solid_box_proxy(obj.canonical_extent)
+                tag = f"bg_box_{leaf}"
+        else:
+            m = _get_mesh_for_instance(obj)
+            if m is None or len(m.faces) == 0:
+                continue
+            tag = obj.catalog_name
         m_world = _mesh_world_pose(obj, m)
-        key = f"seg{obj.seg_id}__{obj.catalog_name}"
-        out[key] = m_world
+        out[f"seg{obj.seg_id}__{tag}"] = m_world
     return out
 
 
