@@ -28,7 +28,7 @@ class SceneObject:
     R_m2c: np.ndarray         # (3, 3) rotation, object→camera
     t_m2c: np.ndarray         # (3,) translation in metres, camera frame
     scale_m2c: float          # uniform scalar
-    canonical_extent: np.ndarray  # (3,) AABB extent in object local frame — orientation-dependent, deprecated
+    canonical_extent: Optional[np.ndarray]  # (3,) AABB extent — may be None (SL writer never emits it)
     oobb_half_extents: Optional[np.ndarray]  # (3,) OOBB half-extents along part principal axes — orientation-invariant; preferred when present
     visibility_ratio: float
     occlusion_ratio: float
@@ -85,6 +85,21 @@ def get_catalog() -> dict[str, str]:
     return _CATALOG_CACHE
 
 
+_BG_TOKENS = {"background", "container", "prop_general", "table", "floor", "bin"}
+
+
+def _canonicalise_class(raw: str) -> str:
+    """Mirror the monocular writer's class-cleaning rule (camera_monocular.py:778-784).
+    SL writer skips this step, so compound labels like 'background,container,prop_general'
+    arrive raw — apply the same precedence here so background detection works."""
+    tokens = {t.strip() for t in raw.split(",") if t.strip()}
+    if tokens & _BG_TOKENS:
+        return "background"
+    if "part" in tokens:
+        return "part"
+    return raw
+
+
 def _parse_objects(scene_info: dict, catalog: dict[str, str]) -> list[SceneObject]:
     out: list[SceneObject] = []
     for obj in scene_info.get("objects", []):
@@ -95,12 +110,13 @@ def _parse_objects(scene_info: dict, catalog: dict[str, str]) -> list[SceneObjec
             R = np.asarray(obj["pose"]["cam_R_m2c"], dtype=np.float64).reshape(3, 3)
             t = np.asarray(obj["pose"]["cam_t_m2c"], dtype=np.float64).reshape(3)
             s = float(obj["pose"]["scale_m2c"][0])
-            canon = np.asarray(obj["canonical_extent"], dtype=np.float64).reshape(3)
+            canon_raw = obj.get("canonical_extent")
+            canon = np.asarray(canon_raw, dtype=np.float64).reshape(3) if canon_raw is not None else None
             oobb_he_raw = obj.get("oobb_half_extents")
             oobb_he = np.asarray(oobb_he_raw, dtype=np.float64).reshape(3) if oobb_he_raw is not None else None
             out.append(SceneObject(
                 seg_id=int(obj["segmentation_id"]),
-                obj_class=str(obj.get("class", "unknown")),
+                obj_class=_canonicalise_class(str(obj.get("class", "unknown"))),
                 prim_path=prim,
                 catalog_name=catalog_name,
                 usd_filepath=usd,
@@ -110,8 +126,7 @@ def _parse_objects(scene_info: dict, catalog: dict[str, str]) -> list[SceneObjec
                 visibility_ratio=float(obj.get("visibility_ratio", 0.0)),
                 occlusion_ratio=float(obj.get("occlusion_ratio", 1.0)),
             ))
-        except (KeyError, ValueError, IndexError) as e:
-            # skip malformed entries (bins with no canonical_extent etc.)
+        except (KeyError, ValueError, IndexError):
             continue
     return out
 

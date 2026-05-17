@@ -133,17 +133,30 @@ def _build_scene_meshes(scene: Scene) -> dict[str, trimesh.Trimesh]:
 
     Background objects (class=='background': bins, robot, mount, fixtures)
     get geometric proxies sized to canonical_extent — hollow box for bins
-    (leaf 'Bin'), solid box for everything else.
+    (leaf 'Bin'), solid box for everything else. When canonical_extent is
+    missing (SL dataset) we fall back to the loaded-asset extent × scale_m2c.
     """
     out: dict[str, trimesh.Trimesh] = {}
     for obj in scene.objects:
         if obj.obj_class == "background":
             leaf = obj.prim_path.rsplit("/", 1)[-1] if obj.prim_path else ""
+            ext = obj.canonical_extent
+            if ext is None and obj.usd_filepath is not None:
+                # Derive from raw asset extent × uniform scale_m2c.
+                try:
+                    base = _MESH_CACHE.get(obj.usd_filepath) or load_usd_mesh(obj.usd_filepath, target_extent=None)
+                    _MESH_CACHE[obj.usd_filepath] = base
+                    s = float(obj.scale_m2c) if np.isscalar(obj.scale_m2c) else float(np.mean(obj.scale_m2c))
+                    ext = np.ptp(base.bounds, axis=0) * s
+                except Exception:
+                    ext = None
+            if ext is None:
+                continue  # no size info → can't build proxy
             if leaf == "Bin":
-                m = _hollow_box_proxy(obj.canonical_extent)
+                m = _hollow_box_proxy(ext)
                 tag = "bin_proxy"
             else:
-                m = _solid_box_proxy(obj.canonical_extent)
+                m = _solid_box_proxy(ext)
                 tag = f"bg_box_{leaf}"
         else:
             m = _get_mesh_for_instance(obj)
@@ -218,7 +231,7 @@ def process_frame(
         "R_m2c": o.R_m2c.tolist(),
         "t_m2c": o.t_m2c.tolist(),
         "scale_m2c": o.scale_m2c,
-        "canonical_extent": o.canonical_extent.tolist(),
+        "canonical_extent": o.canonical_extent.tolist() if o.canonical_extent is not None else None,
         "visibility_ratio": o.visibility_ratio,
         "usd_filepath": o.usd_filepath,
     } for o in scene.objects]
@@ -326,7 +339,7 @@ def process_frame(
             "object": {
                 "file": tgt.usd_filepath,
                 "scale": 1.0,  # mesh is pre-scaled per-axis to canonical_extent
-                "canonical_extent": tgt.canonical_extent.tolist(),
+                "canonical_extent": tgt.canonical_extent.tolist() if tgt.canonical_extent is not None else None,
             },
             "gripper": {
                 "name": "robotiq_2f_140",
