@@ -70,9 +70,17 @@ def _load_rgb(frame_dir: Path) -> np.ndarray:
 
 
 def _draw_one_grasp(ax, grasp_obj_4x4, T_obj2cam, K, color, width_m,
-                    tail_length=GRIPPER_DEPTH, lw=1.5, alpha=0.95, image_size=None):
-    """Draw one grasp on `ax`. Arrow tail = gripper base, head = grasp midpoint.
-    Two small squares at the finger contact points.
+                    approach_stub_m=0.03, lw=1.8, alpha=0.95, image_size=None):
+    """Draw one grasp on `ax`. Visualisation anchored at the GRASP MIDPOINT
+    (where the part sits between the fingers), NOT the gripper base (which is
+    GRIPPER_DEPTH=19.5 cm behind the grasp along approach — drawing the base
+    as the arrow tail makes grasps look like they're in empty space far from
+    the part, even though the grasp itself is correctly on the part).
+
+    Drawn elements (all near the part):
+      - Short approach STUB (~3 cm), tail in air, arrow head AT midpoint
+      - Line segment between the two finger contact points (closing line)
+      - Filled circles at the contact points themselves
     """
     g_cam = T_obj2cam @ np.asarray(grasp_obj_4x4)
     origin_cam = g_cam[:3, 3]   # gripper base
@@ -80,41 +88,42 @@ def _draw_one_grasp(ax, grasp_obj_4x4, T_obj2cam, K, color, width_m,
     z_axis_cam = g_cam[:3, 2]   # approach
     midpoint_cam = origin_cam + GRIPPER_DEPTH * z_axis_cam
 
-    # Skip grasps behind the camera (negative or near-zero Z)
-    if origin_cam[2] <= 0.05 or midpoint_cam[2] <= 0.05:
+    # Skip grasps behind / very close to camera
+    if midpoint_cam[2] <= 0.05:
         return False
 
-    # Project key points
+    # Short approach stub: starts approach_stub_m BEFORE midpoint along approach
+    stub_tail_cam = midpoint_cam - approach_stub_m * z_axis_cam
     pts3d = np.stack([
-        origin_cam,
+        stub_tail_cam,
         midpoint_cam,
-        midpoint_cam + 0.5 * width_m * x_axis_cam,   # left finger contact
-        midpoint_cam - 0.5 * width_m * x_axis_cam,   # right finger contact
+        midpoint_cam + 0.5 * width_m * x_axis_cam,   # +X finger contact
+        midpoint_cam - 0.5 * width_m * x_axis_cam,   # -X finger contact
     ])
     pts2d = _project(K, pts3d)
-    p_base, p_mid, p_left, p_right = pts2d
+    p_stub, p_mid, p_left, p_right = pts2d
 
-    # Bounds-check before drawing
+    # Bounds-check on midpoint only (the visual anchor)
     if image_size is not None:
         W, H = image_size
-        for p in (p_base, p_mid):
-            if not (-50 <= p[0] <= W + 50 and -50 <= p[1] <= H + 50):
-                return False
+        if not (-20 <= p_mid[0] <= W + 20 and -20 <= p_mid[1] <= H + 20):
+            return False
 
-    # Arrow from base → midpoint (approach line)
-    arrow = FancyArrowPatch(
-        (p_base[0], p_base[1]),
+    # Short approach stub: tail in air → head AT midpoint
+    ax.add_patch(FancyArrowPatch(
+        (p_stub[0], p_stub[1]),
         (p_mid[0], p_mid[1]),
-        color=color, arrowstyle="-|>", mutation_scale=10,
+        color=color, arrowstyle="-|>", mutation_scale=8,
         linewidth=lw, alpha=alpha,
-    )
-    ax.add_patch(arrow)
-    # Finger contact marks
-    s = 3
+    ))
+    # Closing line between the two contact points
+    ax.plot([p_left[0], p_right[0]], [p_left[1], p_right[1]],
+            color=color, linewidth=lw, alpha=alpha, solid_capstyle="round")
+    # Filled dots at the two contact points (where the gripper actually touches)
     for p in (p_left, p_right):
-        ax.add_patch(Rectangle((p[0] - s/2, p[1] - s/2), s, s,
-                                facecolor=color, edgecolor="white",
-                                linewidth=0.5, alpha=alpha))
+        ax.plot(p[0], p[1], marker='o', markersize=4,
+                markerfacecolor=color, markeredgecolor='white',
+                markeredgewidth=0.7, alpha=alpha)
     return True
 
 
