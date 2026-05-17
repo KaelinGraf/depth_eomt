@@ -27,7 +27,8 @@ class SceneObject:
     usd_filepath: Optional[str]  # may be None if catalog lookup failed
     R_m2c: np.ndarray         # (3, 3) rotation, object→camera
     t_m2c: np.ndarray         # (3,) translation in metres, camera frame
-    scale_m2c: float          # uniform scalar
+    scale_m2c: float          # uniform scalar (mean of per-axis row norms)
+    scale_m2c_per_axis: np.ndarray  # (3,) original per-axis scale; bins use non-uniform values
     canonical_extent: Optional[np.ndarray]  # (3,) AABB extent — may be None (SL writer never emits it)
     oobb_half_extents: Optional[np.ndarray]  # (3,) OOBB half-extents along part principal axes — orientation-invariant; preferred when present
     visibility_ratio: float
@@ -109,7 +110,8 @@ def _parse_objects(scene_info: dict, catalog: dict[str, str]) -> list[SceneObjec
             usd = catalog.get(catalog_name)
             R = np.asarray(obj["pose"]["cam_R_m2c"], dtype=np.float64).reshape(3, 3)
             t = np.asarray(obj["pose"]["cam_t_m2c"], dtype=np.float64).reshape(3)
-            s = float(obj["pose"]["scale_m2c"][0])
+            s_arr = np.asarray(obj["pose"]["scale_m2c"], dtype=np.float64).reshape(3)
+            s = float(s_arr.mean())
             canon_raw = obj.get("canonical_extent")
             canon = np.asarray(canon_raw, dtype=np.float64).reshape(3) if canon_raw is not None else None
             oobb_he_raw = obj.get("oobb_half_extents")
@@ -120,7 +122,7 @@ def _parse_objects(scene_info: dict, catalog: dict[str, str]) -> list[SceneObjec
                 prim_path=prim,
                 catalog_name=catalog_name,
                 usd_filepath=usd,
-                R_m2c=R, t_m2c=t, scale_m2c=s,
+                R_m2c=R, t_m2c=t, scale_m2c=s, scale_m2c_per_axis=s_arr,
                 canonical_extent=canon,
                 oobb_half_extents=oobb_he,
                 visibility_ratio=float(obj.get("visibility_ratio", 0.0)),

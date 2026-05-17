@@ -41,6 +41,50 @@ logger = logging.getLogger(__name__)
 # Because canonical_extent varies per-instance we cache the RAW mesh and clone+rescale.
 _MESH_CACHE: dict[str, trimesh.Trimesh] = {}
 
+# Bin USDs live in per-bin subdirs under assets/bins/. `objects.json`'s bin
+# paths are stale and don't resolve; we discover bins from disk and match
+# the scene's bin to one of them by canonical_extent.
+_BIN_USD_GLOB = "/home/kaelin/BinPicking/SDG/IS/assets/bins/*/*_inst.usd"
+_BIN_CATALOG: list[dict] | None = None
+_BIN_EXTENT_MATCH_TOL = 0.05  # metres — sum of |Δ| across axes
+
+
+def _get_bin_catalog() -> list[dict]:
+    """Return [{'usd', 'extent', 'mesh'}] for all on-disk bin assets,
+    computed once and cached."""
+    global _BIN_CATALOG
+    if _BIN_CATALOG is None:
+        import glob
+        out = []
+        for usd in sorted(glob.glob(_BIN_USD_GLOB)):
+            try:
+                m = load_usd_mesh(usd, target_extent=None)
+                out.append({
+                    "usd": usd,
+                    "extent": np.ptp(m.bounds, axis=0),
+                    "mesh": m,
+                })
+            except Exception as e:
+                logger.warning(f"bin catalog load failed {usd}: {e}")
+        _BIN_CATALOG = out
+    return _BIN_CATALOG
+
+
+def _match_bin(canonical_extent: np.ndarray) -> dict | None:
+    """Find the on-disk bin whose native extent best matches the scene's
+    canonical_extent. Returns None when no match within tolerance, in which
+    case caller falls back to the hollow-box proxy."""
+    if canonical_extent is None:
+        return None
+    ce = np.sort(np.asarray(canonical_extent, dtype=np.float64))[::-1]
+    best, best_err = None, float("inf")
+    for entry in _get_bin_catalog():
+        ext = np.sort(entry["extent"])[::-1]
+        err = float(np.abs(ce - ext).sum())
+        if err < best_err:
+            best, best_err = entry, err
+    return best if best_err < _BIN_EXTENT_MATCH_TOL else None
+
 
 def _get_mesh_for_instance(obj: SceneObject) -> Optional[trimesh.Trimesh]:
     """Load asset USD mesh and scale to match the in-scene size.
@@ -140,24 +184,31 @@ def _build_scene_meshes(scene: Scene) -> dict[str, trimesh.Trimesh]:
     for obj in scene.objects:
         if obj.obj_class == "background":
             leaf = obj.prim_path.rsplit("/", 1)[-1] if obj.prim_path else ""
-            ext = obj.canonical_extent
-            if ext is None and obj.usd_filepath is not None:
-                # Derive from raw asset extent × uniform scale_m2c.
-                try:
-                    base = _MESH_CACHE.get(obj.usd_filepath) or load_usd_mesh(obj.usd_filepath, target_extent=None)
-                    _MESH_CACHE[obj.usd_filepath] = base
-                    s = float(obj.scale_m2c) if np.isscalar(obj.scale_m2c) else float(np.mean(obj.scale_m2c))
-                    ext = np.ptp(base.bounds, axis=0) * s
-                except Exception:
-                    ext = None
-            if ext is None:
-                continue  # no size info → can't build proxy
+            # (a) Bins → match to the on-disk bin USD by extent (real mesh).
             if leaf == "Bin":
-                m = _hollow_box_proxy(ext)
-                tag = "bin_proxy"
-            else:
-                m = _solid_box_proxy(ext)
+                matched = _match_bin(obj.canonical_extent)
+                if matched is not None:
+                    m = matched["mesh"].copy()
+                    m.apply_scale(obj.scale_m2c_per_axis)
+                    tag = f"bin_{Path(matched['usd']).stem}"
+                elif obj.canonical_extent is not None:
+                    m = _hollow_box_proxy(obj.canonical_extent)
+                    tag = "bin_proxy"
+                else:
+                    continue  # SL bin: no size info, can't proxy
+            # (b) Outlier parts (re-tagged background by update_semantic_labels_for_outliers)
+            #     have a real usd_filepath — load actual mesh, not a coarse box.
+            elif obj.usd_filepath is not None:
+                m = _get_mesh_for_instance(obj)
+                if m is None or len(m.faces) == 0:
+                    continue
+                tag = f"bg_{obj.catalog_name}"
+            # (c) Other background (robot, mount, fixtures) → solid box from canonical_extent.
+            elif obj.canonical_extent is not None:
+                m = _solid_box_proxy(obj.canonical_extent)
                 tag = f"bg_box_{leaf}"
+            else:
+                continue
         else:
             m = _get_mesh_for_instance(obj)
             if m is None or len(m.faces) == 0:
