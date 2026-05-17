@@ -43,14 +43,19 @@ _MESH_CACHE: dict[str, trimesh.Trimesh] = {}
 
 
 def _get_mesh_for_instance(obj: SceneObject) -> Optional[trimesh.Trimesh]:
-    """Load the asset USD mesh and scale uniformly by scale_m2c.
+    """Load asset USD mesh and scale to match the in-scene size.
 
-    The mesh is returned in the asset's intrinsic local frame (centroid-aligned,
-    canonical orientation). The caller then places it via R_m2c/t_m2c — that
-    rotation produces the in-scene AABB which scene_info records as
-    canonical_extent. (Earlier per-axis "fit canonical_extent" was wrong: SDG's
-    canonical_extent is the post-rotation in-scene AABB, not the asset's
-    intrinsic extent, so per-axis stretching corrupted the asset's shape.)
+    Two scaling paths, depending on what scene_info recorded:
+      - OOBB available (post-2026-05-17 SDG): scale per-axis so the loaded
+        mesh's OOBB half-extents match the recorded ones. OOBB is orientation-
+        invariant, so this gives the asset's true intrinsic shape at the true
+        scene scale — robust even when Isaac Sim's reference compositing
+        changes the standalone-asset bbox vs the in-scene one.
+      - Only AABB (pre-2026-05-17 data): fall back to uniform scale_m2c. The
+        AABB canonical_extent is orientation-dependent and unreliable per-axis;
+        scale_m2c is the safest single-number proxy.
+
+    Caller places mesh via R_m2c/t_m2c.
     """
     if obj.usd_filepath is None:
         return None
@@ -58,8 +63,22 @@ def _get_mesh_for_instance(obj: SceneObject) -> Optional[trimesh.Trimesh]:
         if obj.usd_filepath not in _MESH_CACHE:
             _MESH_CACHE[obj.usd_filepath] = load_usd_mesh(obj.usd_filepath, target_extent=None)
         m = _MESH_CACHE[obj.usd_filepath].copy()
-        s = float(obj.scale_m2c) if np.isscalar(obj.scale_m2c) else float(np.mean(obj.scale_m2c))
-        m.apply_scale(s)
+        if obj.oobb_half_extents is not None:
+            from trimesh.bounds import oriented_bounds
+            try:
+                T_to_canonical, asset_extent = oriented_bounds(m)
+                m.apply_transform(T_to_canonical)
+                safe = np.where(asset_extent > 1e-9, asset_extent, 1.0)
+                # asset_extent is full extents; oobb_half_extents are half
+                scale_per_axis = (2.0 * obj.oobb_half_extents) / safe
+                m.apply_scale(scale_per_axis)
+            except Exception as e:
+                logger.warning(f"OOBB fit failed for {Path(obj.usd_filepath).name}: {e}; falling back to scale_m2c")
+                s = float(obj.scale_m2c) if np.isscalar(obj.scale_m2c) else float(np.mean(obj.scale_m2c))
+                m.apply_scale(s)
+        else:
+            s = float(obj.scale_m2c) if np.isscalar(obj.scale_m2c) else float(np.mean(obj.scale_m2c))
+            m.apply_scale(s)
         return m
     except Exception as e:
         logger.warning(f"mesh load failed {obj.usd_filepath}: {e}")

@@ -28,7 +28,8 @@ class SceneObject:
     R_m2c: np.ndarray         # (3, 3) rotation, object→camera
     t_m2c: np.ndarray         # (3,) translation in metres, camera frame
     scale_m2c: float          # uniform scalar
-    canonical_extent: np.ndarray  # (3,) axis-aligned bbox extent in object local frame
+    canonical_extent: np.ndarray  # (3,) AABB extent in object local frame — orientation-dependent, deprecated
+    oobb_half_extents: Optional[np.ndarray]  # (3,) OOBB half-extents along part principal axes — orientation-invariant; preferred when present
     visibility_ratio: float
     occlusion_ratio: float
 
@@ -95,6 +96,8 @@ def _parse_objects(scene_info: dict, catalog: dict[str, str]) -> list[SceneObjec
             t = np.asarray(obj["pose"]["cam_t_m2c"], dtype=np.float64).reshape(3)
             s = float(obj["pose"]["scale_m2c"][0])
             canon = np.asarray(obj["canonical_extent"], dtype=np.float64).reshape(3)
+            oobb_he_raw = obj.get("oobb_half_extents")
+            oobb_he = np.asarray(oobb_he_raw, dtype=np.float64).reshape(3) if oobb_he_raw is not None else None
             out.append(SceneObject(
                 seg_id=int(obj["segmentation_id"]),
                 obj_class=str(obj.get("class", "unknown")),
@@ -103,6 +106,7 @@ def _parse_objects(scene_info: dict, catalog: dict[str, str]) -> list[SceneObjec
                 usd_filepath=usd,
                 R_m2c=R, t_m2c=t, scale_m2c=s,
                 canonical_extent=canon,
+                oobb_half_extents=oobb_he,
                 visibility_ratio=float(obj.get("visibility_ratio", 0.0)),
                 occlusion_ratio=float(obj.get("occlusion_ratio", 1.0)),
             ))
