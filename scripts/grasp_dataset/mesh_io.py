@@ -30,7 +30,7 @@ from pxr import Usd, UsdGeom
 logger = logging.getLogger(__name__)
 
 
-def _gather_mesh_points_and_faces(stage: Usd.Stage, prefer_collision: bool = True):
+def _gather_mesh_points_and_faces(stage: Usd.Stage, prefer_collision: bool = False):
     """Walk USD stage, gather mesh prims, return (verts, faces) in world frame.
 
     Returns concatenated arrays across all matched mesh prims.
@@ -67,8 +67,28 @@ def _gather_mesh_points_and_faces(stage: Usd.Stage, prefer_collision: bool = Tru
         counts = np.asarray(counts, dtype=np.int32)
         indices = np.asarray(indices, dtype=np.int32)
 
-        # Apply local-to-world (within the USD itself) so multiple meshes line up
-        xf = np.asarray(UsdGeom.Xformable(mp).ComputeLocalToWorldTransform(tcode), dtype=np.float64)
+        # Choose transform composition:
+        # - If the mesh has its OWN xformOp:scale (typical for YCB-style USDs
+        #   where authoring units differ from metres and the mesh bakes the
+        #   conversion locally), apply ONLY the mesh's own transform. Isaac
+        #   Sim drops intermediate Xform-only parent scales at runtime in
+        #   this configuration, and following the full ancestor chain would
+        #   bake in scales Isaac never applied (e.g., a 5× discrepancy for
+        #   /Root/Geometry's xformOp:scale=0.15 above pitcher's mesh).
+        # - Otherwise (legacy distractor-style USDs where the mesh is at
+        #   identity and all scaling lives on ancestor Xforms), use the full
+        #   local-to-world chain so units convert correctly.
+        xformable_mp = UsdGeom.Xformable(mp)
+        own_ops = xformable_mp.GetOrderedXformOps()
+        has_own_scale = any(
+            op.GetOpType() == UsdGeom.XformOp.TypeScale
+            and tuple(op.Get()) != (1.0, 1.0, 1.0)
+            for op in own_ops
+        )
+        if has_own_scale:
+            xf = np.asarray(xformable_mp.GetLocalTransformation(tcode), dtype=np.float64)
+        else:
+            xf = np.asarray(xformable_mp.ComputeLocalToWorldTransform(tcode), dtype=np.float64)
         # USD matrices are row-vector convention: v' = v @ M
         pts_h = np.hstack([pts, np.ones((len(pts), 1))])
         pts_world = (pts_h @ xf)[:, :3]
@@ -99,7 +119,7 @@ def _gather_mesh_points_and_faces(stage: Usd.Stage, prefer_collision: bool = Tru
 def load_usd_mesh(
     usd_path: str | Path,
     target_extent: Optional[np.ndarray] = None,
-    prefer_collision: bool = True,
+    prefer_collision: bool = False,
 ) -> trimesh.Trimesh:
     """Load a USD asset as a trimesh, optionally rescaling to a target AABB extent.
 
