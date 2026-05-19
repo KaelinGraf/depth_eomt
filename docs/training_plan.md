@@ -679,4 +679,127 @@ metrics (AbsRel/δ1) actually improve.
 
 ---
 
+## 13. Numerics & fp16 stability (lessons from the first curriculum run)
+
+The first attempts at running the full curriculum surfaced an
+**fp16-numerics class of NaN** in the training loss that wasn't visible
+in the SI-Log-only baseline. Documenting it here so future runs don't
+re-learn the lesson.
+
+### 13.1 Symptom
+
+Under Lightning's `precision: 16-mixed`, the *total* training loss
+(`losses/train_loss_total`) intermittently displayed `nan` on the tqdm
+progress bar.
+
+- **Run `gvp8`** (curriculum, no fp32 wraps): ~3 % of batches NaN, 48
+  events between step 110 and step 1627 — onset early, before
+  `aux_ramp` was contributing meaningfully in magnitude (a single NaN
+  *element* contaminates the reduction regardless of coefficient).
+- **Run `pn3d`** (curriculum, aux losses wrapped in fp32 but depth not
+  source-clamped): rate dropped to ~1.5 % then *climbed* to ~2.5 % by
+  step 322 — a partial fix.
+
+The run kept making progress in both cases (Lightning's `GradScaler`
+skips the optimiser step on each non-finite gradient), but burned ~2-3 %
+of batches and the trajectory was getting worse, not better.
+
+### 13.2 Root causes
+
+Two distinct fp16 hazards, each capable of producing a NaN element that
+then propagates:
+
+1. **`exp` activation in the DPT depth head overflows to `inf` under
+   fp16.** `models/dpt.py` applies `exp(main_logits)` for `head_name="depth"`;
+   under `autocast(float16)` any logit above ~11 produces `+inf`. A
+   single `inf` pixel in `depth_pred` poisons every downstream term:
+   - SI-Log: `log(inf) = inf` → `mean(R²) = inf`, `mean(R)² = inf`,
+     `inf − λ·inf = NaN` even before the sqrt.
+   - `loss_depth_grad`: same `log` chain.
+   - `loss_depth_normal_consistency`: `unproject(inf, K) = inf` points →
+     `cross(inf, inf) = NaN` in the implied-normal computation.
+2. **Cross-products of fp16 tangent vectors at near-equal-depth
+   neighbours.** In `depth_to_normals`, when two adjacent depth pixels
+   round to the *same* fp16 value (the entire bin floor on a smooth
+   prediction is a large patch of this), the tangent vectors are
+   exactly zero, `cross(0, 0) = 0`, and the autograd path through
+   `F.normalize(0, eps)` has an undefined derivative — backward yields
+   NaN gradients for that pixel.
+
+### 13.3 The three layers of clamping (all needed)
+
+Source-side clamps prevent the NaNs from ever existing; sink-side
+`nan_to_num` floors catch anything that slips through.
+
+**(a) `models/eomt.py:forward` — clamp the depth output and sanitize
+the normal output.**
+
+```python
+# Right after the depth head call + .unsqueeze(1):
+depth = depth.clamp(min=1e-4, max=20.0)
+
+# Right after the normal head call + F.normalize:
+normal = torch.nan_to_num(normal, nan=0.0, posinf=0.0, neginf=0.0)
+```
+
+Real bin depths are 0.6–0.9 m and the SI-Log validity mask already
+discards `d_gt ≥ 10 m`, so `max=20` only chops infinities; `min=1e-4`
+symmetrically guards underflow.
+
+**(b) `training/depth_loss.py` — `_aux_loss_fp32` decorator on the four
+aux losses.** Forces fp32 throughout the loss body regardless of the
+caller's autocast context. Floating-point tensor args are promoted to
+`.float()`; bool / int tensors (the `valid` masks) pass through.
+Applied to: `loss_depth_grad`, `loss_normal_angular`, `loss_normal_grad`,
+`loss_depth_normal_consistency`. SI-Log is intentionally **not**
+wrapped — it was stable in the baseline run and the wrapper isn't free.
+
+**(c) `training/depth_loss.py` — `torch.nan_to_num` on every loss's
+return value.** Belt-and-suspenders: if anything slips through (a, b),
+the loss term floors to 0 (effectively skipping that batch's gradient
+for the affected term — the same behavior `GradScaler` would impose
+later but applied per-term, not whole-batch).
+
+### 13.4 Verification
+
+- **Unit-test the loss path with adversarial inputs** —
+  `training/depth_loss.py` should produce finite output when fed
+  tensors containing `inf` and `nan` elements directly. The smoke
+  pattern (also useful for future regressions):
+  - constant-depth fp16 batch (exercises the cross-product underflow)
+  - tensors with sprinkled `inf` / `nan` elements (exercises the floors)
+  - both should return finite, sensible values; the aux losses should
+    return in fp32 dtype regardless of caller context.
+- **Monitor `train_loss_total=nan` count** during the first ~500 steps
+  of any curriculum run. A non-zero count there means one of (a)–(c)
+  isn't catching the path that's NaN'ing.
+
+### 13.5 What this changes upstream
+
+§11 checklist — add to the prerequisites:
+
+```
+[x] §13.3a  eomt.py: clamp depth ∈ [1e-4, 20], nan_to_num the normal
+[x] §13.3b  depth_loss.py: _aux_loss_fp32 on the 4 aux losses
+[x] §13.3c  depth_loss.py: nan_to_num on every loss return
+```
+
+**Verification run `nyyo`** (with all three layers of clamping landed):
+trained to **step 535** of epoch 0 → **`nan_count = 0`** across the
+full window. No checkpoint was saved (stopped before the first epoch
+boundary; Lightning's default `ModelCheckpoint` only fires at
+`on_train_epoch_end`, and there's no `every_n_train_steps` schedule
+in the yaml). The next real curriculum run should either reach
+epoch 0's end (~22 min at bs=4 / 2.65 it/s) for the default ckpt to
+land, or add a step-based ModelCheckpoint to `eomt_large_640.yaml`
+under `trainer.callbacks` if mid-epoch resumability is wanted.
+
+Run `pn3d` was the partial-fix attempt (aux losses fp32 but no source
+clamp on `depth`); stopped at step 417 (~12 % epoch 0), NaN rate
+climbing (2.5 % and rising). Run `gvp8` was the unpatched original
+(~3 % NaN). Neither is a useful checkpoint for downstream comparison —
+those checkpoint dirs can be safely deleted.
+
+---
+
 End of plan.

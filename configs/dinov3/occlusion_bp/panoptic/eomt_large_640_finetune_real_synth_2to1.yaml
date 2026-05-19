@@ -1,0 +1,75 @@
+trainer:
+  # Run 2: real+synth 2:1 mix (45 real + 90 synth per epoch = 135 samples =
+  # 67 steps@bs=2). max_epochs=80 (operator tweak from 50, +15 min insurance
+  # vs PQ plateau) → ~5360 total steps. Resume from sim baseline
+  # 0rx606su/epoch=42-step=304569.ckpt to make Runs 1 & 2 independent
+  # alternatives off the same starting point.
+  max_epochs: 80
+  gradient_clip_val: 1.0
+  precision: 32-true
+  callbacks:
+    - class_path: training.head_only_freeze.HeadOnlyFreezeCallback
+      init_args:
+        last_n_blocks: 4
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        save_top_k: 3
+        monitor: epoch
+        mode: max
+        save_last: True
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "iscar_bp_finetune_real_synth_2to1_round1_heads_last4"
+model:
+  class_path: training.mask_classification_panoptic.MaskClassificationPanoptic
+  init_args:
+    ckpt_path: "checkpoints/eomt_large_640.bin"
+    num_classes: 2
+    load_ckpt_class_head: False
+    use_area_weighting: True
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [0, 283520, 425280, 567040]
+    attn_mask_annealing_end_steps: [28770, 425280, 567040, 708800]
+    depth_coefficient: 0.0
+    depth_grad_coefficient: 0.0
+    normal_coefficient: 0.0
+    normal_grad_coefficient: 0.0
+    consistency_coefficient: 0.0
+    aux_loss_warmup_steps: 1
+    lr: 5e-5
+    lr_mult: 0.1
+    weight_decay: 0.0
+    llrd_l2_enabled: False
+    warmup_steps: [200, 200]
+    backbone_freeze_steps: 0
+    delta_weights: True
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        enable_occlusion: True
+        num_q: 200
+        depth_taps: [4, 11, 17, 23]
+        use_intrinsics: true
+        enable_normals: true
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: facebook/dinov3-vitl16-pretrain-lvd1689m
+
+data:
+  class_path: datasets.iscar_bp.MixedReplicatorDataModule
+  init_args:
+    real_path:  "/home/kaelin/BinPicking/RealDataset/round_001_replicator"
+    synth_path: "/home/kaelin/BinPicking/SDG/IS/Outputs/monocular_dataset"
+    real_per_epoch:  45
+    synth_per_epoch: 90
+    stuff_classes: [0]
+    num_classes: 2
+    img_size: [640, 640]
+    batch_size: 2
+    scale_range: [1.0, 1.0]
+    color_jitter_enabled: True
+    num_workers: 4

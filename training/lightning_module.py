@@ -56,6 +56,8 @@ class LightningModule(lightning.LightningModule):
         weight_decay: float,
         poly_power: float,
         warmup_steps: tuple[int, int],
+        backbone_freeze_steps: int = 0,
+        aux_loss_warmup_steps: int = 0,
         ckpt_path=None,
         delta_weights=False,
         load_ckpt_class_head=True,
@@ -74,6 +76,13 @@ class LightningModule(lightning.LightningModule):
         self.weight_decay = weight_decay
         self.poly_power = poly_power
         self.warmup_steps = warmup_steps
+        # Stage-A hard freeze: backbone groups stay at lr=0 until this step,
+        # then ramp over warmup_steps[1]. 0 ⇒ no extra freeze (legacy 2-stage).
+        self.backbone_freeze_steps = backbone_freeze_steps
+        # Linear warmup for the *aux* depth/normal losses (curriculum):
+        # criterion.aux_ramp is scaled to min(1, step / aux_loss_warmup_steps)
+        # in on_train_batch_end. 0 = no ramp (full aux from step 0).
+        self.aux_loss_warmup_steps = aux_loss_warmup_steps
         self.llrd_l2_enabled = llrd_l2_enabled
 
         self.strict_loading = False
@@ -128,21 +137,23 @@ class LightningModule(lightning.LightningModule):
                         block_i = int(name_list[i + 1])
                         is_block = True
 
+                # DA3 discriminative LR: every backbone param sits under a
+                # ceiling of `self.lr * self.lr_mult`. llrd decay applies on
+                # top. With lr_mult=1.0 this is a no-op (legacy behaviour).
+                lr *= self.lr_mult
+
                 if is_block or block_i == 0:
                     lr *= self.llrd ** (backbone_blocks - 1 - block_i)
 
-                elif (is_block or block_i == 0) and self.lr_mult != 1.0:
-                    lr *= self.lr_mult
-
                 if "backbone.norm" in name:
-                    lr = self.lr
+                    lr = self.lr * self.lr_mult
 
                 if (
                     is_block
                     and (block_i in l2_blocks)
-                    and ((not self.llrd_l2_enabled) or (self.lr_mult != 1.0))
+                    and (not self.llrd_l2_enabled)
                 ):
-                    lr = self.lr
+                    lr = self.lr * self.lr_mult
 
                 backbone_param_groups.append(
                     {"params": [param], "lr": lr, "name": name}
@@ -161,6 +172,7 @@ class LightningModule(lightning.LightningModule):
             warmup_steps=self.warmup_steps,
             total_steps=self.trainer.estimated_stepping_batches,
             poly_power=self.poly_power,
+            backbone_freeze_steps=self.backbone_freeze_steps,
         )
 
         return {
@@ -194,29 +206,40 @@ class LightningModule(lightning.LightningModule):
             class_logits_per_block,
             occlusion_logits_per_block,
             depth_pred,
+            normal_pred,
             _,
         ) = self(imgs, intrinsics=intrinsics)
 
-        # Stack the per-image depth GT once if any target carries depth.
-        # Targets without depth (e.g. legacy datasets) leave depth_gt None
-        # and the criterion skips the depth term — keeps full back-compat.
+        # Stack the per-image depth + normal GT once if any target carries
+        # them. Targets without (e.g. legacy datasets) leave them None and
+        # the criterion skips the term — preserves backward compat.
         depth_gt = None
         if depth_pred is not None and "depth" in targets[0]:
             depth_gt = torch.stack(
                 [t["depth"] for t in targets], dim=0
             ).to(depth_pred.device, depth_pred.dtype)
+        normals_gt = None
+        if normal_pred is not None and "normals" in targets[0]:
+            normals_gt = torch.stack(
+                [t["normals"] for t in targets], dim=0
+            ).to(normal_pred.device, normal_pred.dtype)
 
         losses_all_blocks = {}
         last_block_idx = len(mask_logits_per_block) - 1
         for i, (mask_logits, class_logits, occlusion_logits) in enumerate(
             list(zip(mask_logits_per_block, class_logits_per_block, occlusion_logits_per_block))
         ):
-            # Depth is supervised only at the final layer (single regression
-            # output, not deep-supervised — see depth_integration_plan §6.3).
+            # Depth / normal supervision is only at the final layer (single
+            # regression output, not deep-supervised — depth_integration_plan §6.3).
             kw_depth = {}
             if i == last_block_idx and depth_gt is not None:
                 kw_depth["depth_pred"] = depth_pred
                 kw_depth["depth_gt"] = depth_gt
+                if normal_pred is not None and normals_gt is not None:
+                    kw_depth["normal_pred"] = normal_pred
+                    kw_depth["normals_gt"] = normals_gt
+                    if intrinsics is not None:
+                        kw_depth["intrinsics"] = intrinsics
 
             losses = self.criterion(
                 masks_queries_logits=mask_logits,
@@ -229,7 +252,40 @@ class LightningModule(lightning.LightningModule):
             losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
             losses_all_blocks |= losses
 
-        return self.criterion.loss_total(losses_all_blocks, self.log)
+        loss_total = self.criterion.loss_total(losses_all_blocks, self.log)
+
+        # Loss-level NaN-skip: return None on non-finite loss so Lightning
+        # skips backward + optimizer. (Not sufficient by itself — gradients
+        # can be NaN even when the loss is finite; see on_before_optimizer_step
+        # below for the gradient-level guard that actually prevents weight
+        # corruption.)
+        finite = torch.isfinite(loss_total).all()
+        self.log("losses/nan_skip", (~finite).float(), prog_bar=False)
+        if not finite:
+            return None
+        return loss_total
+
+    def on_before_optimizer_step(self, optimizer):
+        # Gradient-level NaN guard. Lightning's `gradient_clip_val=0.01` +
+        # native AMP GradScaler are supposed to skip the optimizer step when
+        # gradients contain inf/nan, but in practice we saw weights for
+        # `intrinsics_mlp.*` and `network.q.weight` become 100% NaN at epoch
+        # 2 step ~5750. Mechanism: a single batch produces finite loss but
+        # inf/nan gradients on a few params; `clip_grad_norm_` propagates the
+        # NaN (norm of NaN-tensor = NaN); the unscale+skip logic doesn't
+        # cover the path; optimizer.step writes NaN into the weights.
+        # Replacing inf/nan with 0 here gives those params a no-op step
+        # for the bad batch, while healthy params still update normally.
+        nan_param_count = 0
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if not torch.isfinite(p.grad).all():
+                    nan_param_count += 1
+                    p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+        if nan_param_count > 0:
+            self.log("losses/grad_nan_skip", float(nan_param_count), prog_bar=False)
 
     def validation_step(self, batch, batch_idx=0):
         return self.eval_step(batch, batch_idx, "val")
@@ -267,6 +323,17 @@ class LightningModule(lightning.LightningModule):
                     attn_mask_prob,
                     on_step=True,
                 )
+
+        # Curriculum ramp for the aux depth/normal losses. Mirrors the
+        # attn_mask_annealing pattern: criterion.aux_ramp is read inside the
+        # NEXT batch's loss_total. With aux_loss_warmup_steps=0 the ramp
+        # stays at 1.0 (full aux from step 0; no curriculum).
+        if hasattr(self, "criterion"):
+            if self.aux_loss_warmup_steps > 0:
+                ramp = min(1.0, max(0.0, self.global_step / float(self.aux_loss_warmup_steps)))
+            else:
+                ramp = 1.0
+            self.criterion.aux_ramp = ramp
 
     def init_metrics_semantic(self, ignore_idx, num_blocks):
         self.metrics = nn.ModuleList(
@@ -986,14 +1053,18 @@ class LightningModule(lightning.LightningModule):
                 ]
             else:
                 missing_keys = incompatible_keys.missing_keys
-            # The DPT depth head is added on top of the EoMT model and is
-            # always trained from scratch (or initialised from DA3 weights
-            # via a separate path). The IntrinsicsMLP is likewise new and
-            # absent from pre-depth checkpoints. Old EoMT checkpoints
-            # predate both — exempt those keys from the missing-keys check.
+            # New / optional heads that are absent from pre-depth+normal
+            # EoMT checkpoints — exempt them from the missing-keys check.
+            # _reinit_missing_modules handles their initialisation:
+            #   depth_head, intrinsics_mlp, normal_head — added post-sprint
+            #   occlusion_head — added in commit 00d760c, missing from older
+            #                    .bin checkpoints (chunk #11 addendum).
             missing_keys = [
                 k for k in missing_keys
-                if "depth_head" not in k and "intrinsics_mlp" not in k
+                if "depth_head" not in k
+                and "intrinsics_mlp" not in k
+                and "normal_head" not in k
+                and "occlusion_head" not in k
             ]
             if missing_keys:
                 raise ValueError(f"Missing keys: {missing_keys}")

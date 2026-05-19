@@ -54,6 +54,7 @@ class DPT(nn.Module):
         output_dim: int = 1,
         activation: str = "exp",
         conf_activation: str = "expp1",
+        predict_conf: bool = True,
         features: int = 256,
         out_channels: Sequence[int] = (256, 512, 1024, 1024),
         pos_embed: bool = False,
@@ -82,7 +83,11 @@ class DPT(nn.Module):
 
         # Main head: output dimension and confidence switch
         self.out_dim = output_dim
-        self.has_conf = output_dim > 1
+        # `output_dim > 1` historically auto-enables a confidence channel,
+        # splitting the last channel off as `<head_name>_conf`. That's wrong
+        # for a clean multi-channel output (e.g. a 3-ch normal head); pass
+        # `predict_conf=False` in that case. Default keeps legacy behaviour.
+        self.has_conf = (output_dim > 1) and predict_conf
 
         # Sky head parameters (always 1 channel)
         self.use_sky_head = use_sky_head

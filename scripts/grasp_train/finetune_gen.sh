@@ -42,7 +42,7 @@ cd "${GRASPGEN_DIR}/scripts" && python train_graspgen.py \
     data.grasp_root_dir="${DATA_DIR}/grasp_data/${GRIPPER}" \
     data.dataset_name=iscar \
     data.dataset_version=v2 \
-    data.prob_point_cloud=0.5 \
+    data.prob_point_cloud=-1 \
     data.redundancy=7 \
     data.gripper_name=${GRIPPER} \
     data.cache_dir="${CACHE_DIR}" \

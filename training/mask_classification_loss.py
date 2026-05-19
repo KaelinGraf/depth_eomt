@@ -21,7 +21,14 @@ from transformers.models.mask2former.modeling_mask2former import (
     dice_loss,
 )
 
-from training.depth_loss import loss_depth_silog
+from training.depth_loss import (
+    loss_depth_silog,
+    loss_depth_grad,
+    loss_normal_angular,
+    loss_normal_grad,
+    loss_depth_normal_consistency,
+    valid_depth_mask,
+)
 
 
 class MaskClassificationLoss(Mask2FormerLoss):
@@ -37,6 +44,10 @@ class MaskClassificationLoss(Mask2FormerLoss):
         no_object_coefficient: float,
         occlusion_coefficient: float = None,
         depth_coefficient: float = 1.0,
+        depth_grad_coefficient: float = 0.0,
+        normal_coefficient: float = 0.0,
+        normal_grad_coefficient: float = 0.0,
+        consistency_coefficient: float = 0.0,
         use_area_weighting: bool = False,
     ):
         nn.Module.__init__(self)
@@ -48,6 +59,15 @@ class MaskClassificationLoss(Mask2FormerLoss):
         self.class_coefficient = class_coefficient
         self.occlusion_coefficient = occlusion_coefficient
         self.depth_coefficient = depth_coefficient
+        self.depth_grad_coefficient = depth_grad_coefficient
+        self.normal_coefficient = normal_coefficient
+        self.normal_grad_coefficient = normal_grad_coefficient
+        self.consistency_coefficient = consistency_coefficient
+        # Curriculum ramp scalar (updated by the LightningModule per step) —
+        # scales the *aux* losses (depth-grad / normals / normal-grad /
+        # consistency) but NOT primary depth (SI-Log) or panoptic terms.
+        # Default 1.0 = no ramp (full aux from step 0).
+        self.aux_ramp: float = 1.0
         self.num_labels = num_labels
         self.eos_coef = no_object_coefficient
         self.use_area_weighting = use_area_weighting
@@ -71,6 +91,9 @@ class MaskClassificationLoss(Mask2FormerLoss):
         occlusion_queries_logits: Optional[torch.Tensor] = None,
         depth_pred: Optional[torch.Tensor] = None,
         depth_gt: Optional[torch.Tensor] = None,
+        normal_pred: Optional[torch.Tensor] = None,
+        normals_gt: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None,
     ):
         mask_labels = [
             target["masks"].to(masks_queries_logits.dtype) for target in targets
@@ -94,10 +117,29 @@ class MaskClassificationLoss(Mask2FormerLoss):
         if occlusion_queries_logits is not None:
             loss_occlusion = self.loss_occlusion(occlusion_queries_logits, occlusion_labels, indices,class_labels)
             out = {**out, **loss_occlusion}
-        # Depth supervision: only computed at the layer where depth_pred is
-        # passed (typically just the final layer — see depth_integration_plan §6.3).
+        # Depth + normal supervision — computed only at the layer where
+        # `depth_pred` is passed (final layer; see depth_integration_plan
+        # §6.3). loss_normal* / loss_consistency activate when the matching
+        # tensors are supplied; coefficients in `loss_total` gate the actual
+        # contribution to the total (default 0 → no effect).
         if depth_pred is not None and depth_gt is not None:
             out["loss_depth"] = loss_depth_silog(depth_pred, depth_gt)
+            out["loss_depth_grad"] = loss_depth_grad(depth_pred, depth_gt)
+            if normal_pred is not None and normals_gt is not None:
+                # Per-pixel validity gates the normal terms via the depth mask
+                # (finite + 0 < d < d_max). For Replicator's synthetic data
+                # this is all-True in non-padded regions.
+                valid = valid_depth_mask(depth_gt)
+                out["loss_normal"] = loss_normal_angular(
+                    normal_pred, normals_gt, valid
+                )
+                out["loss_normal_grad"] = loss_normal_grad(
+                    normal_pred, normals_gt, valid
+                )
+                if intrinsics is not None:
+                    out["loss_consistency"] = loss_depth_normal_consistency(
+                        depth_pred, normal_pred, intrinsics, valid
+                    )
         return out
 
     def loss_masks(self, masks_queries_logits, mask_labels, indices):
@@ -209,10 +251,23 @@ class MaskClassificationLoss(Mask2FormerLoss):
         for loss_key, loss in losses_all_layers.items():
             log_fn(f"losses/train_{loss_key}", loss, sync_dist=True)
 
-            if "depth" in loss_key:
-                # Check depth before mask: "depth" key doesn't contain "mask",
-                # but cleaner to put it first to make the precedence explicit.
+            # Specific-first ordering: `loss_depth_grad` / `loss_normal_grad`
+            # contain "depth" / "normal" as substrings, so the more-specific
+            # `_grad` keys must match before the broader ones. The aux losses
+            # (grad / normal / consistency) are additionally scaled by
+            # `self.aux_ramp` so the LightningModule can warm them in via a
+            # curriculum schedule; primary depth (SI-Log) + panoptic losses
+            # are NOT ramped.
+            if loss_key.startswith("loss_depth_grad"):
+                weighted_loss = loss * self.depth_grad_coefficient * self.aux_ramp
+            elif loss_key.startswith("loss_depth"):
                 weighted_loss = loss * self.depth_coefficient
+            elif loss_key.startswith("loss_normal_grad"):
+                weighted_loss = loss * self.normal_grad_coefficient * self.aux_ramp
+            elif loss_key.startswith("loss_normal"):
+                weighted_loss = loss * self.normal_coefficient * self.aux_ramp
+            elif loss_key.startswith("loss_consistency"):
+                weighted_loss = loss * self.consistency_coefficient * self.aux_ramp
             elif "mask" in loss_key:
                 weighted_loss = loss * self.mask_coefficient
             elif "dice" in loss_key:
@@ -230,5 +285,6 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 loss_total = torch.add(loss_total, weighted_loss)
 
         log_fn("losses/train_loss_total", loss_total, sync_dist=True, prog_bar=True)
+        log_fn("losses/aux_ramp", self.aux_ramp)
 
         return loss_total  # type: ignore

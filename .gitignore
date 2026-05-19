@@ -9,6 +9,20 @@ dino_weights/
 scratch*
 Depth-Anything-3/
 
+# Claude / agent scratch
+.claude/
+CLAUDE.md
+handoff.md
+memory.md
+
+# Grasp fine-tuning + inference outputs + run logs
+grasp_finetune_data/
+grasp_finetune_results/
+inference_outputs/
+logs/
+eomt/
+*.log
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

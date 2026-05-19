@@ -33,6 +33,18 @@ log = logging.getLogger(__name__)
 GRIPPER = "robotiq_2f_140"
 VAL_FRACTION = 0.15
 SEED = 42
+# Objects with fewer than this many positive grasps trip GraspGen's per-object
+# sampler (the procedural neg_hncolliding category perturbs positives and
+# re-checks collision; too few positives → ragged batch → tensor shape
+# mismatch in discriminator.forward). 500 = headroom over the 150 positives
+# pulled per object per batch at num_grasps_per_object=300 + discriminator_ratio.
+MIN_POSITIVES = 500
+# Cap grasps per object when merging. We have median ~40k positives + 200k+
+# negatives per object across 1000s of source frames, producing 1-2 GB JSONs
+# per object that take 90+ s to parse. GraspGen samples num_grasps_per_object
+# (≤500) per epoch anyway — 5k+5k per object is 30+× the per-epoch draw,
+# plenty for training variety while keeping JSONs ≤50 MB and cache build fast.
+MAX_GRASPS_PER_OBJECT = 5000  # per polarity (positive and negative)
 
 
 def gather_grasps(grasp_root: Path) -> dict[str, list[Path]]:
@@ -66,9 +78,13 @@ def export_obj(usd_path: str, out_path: Path) -> bool:
         return False
 
 
-def merge_grasps(json_paths: list[Path], obj_rel_path: str, source_count: int) -> dict:
-    """Concatenate transforms + object_in_gripper across every per-frame JSON of
-    one asset into a single GraspGen-compatible record."""
+def merge_grasps(json_paths: list[Path], obj_rel_path: str, source_count: int,
+                 max_per_polarity: int = MAX_GRASPS_PER_OBJECT,
+                 seed: int = SEED) -> dict:
+    """Concatenate transforms + object_in_gripper across every per-frame JSON
+    of one asset, then RANDOM-SAMPLE down to max_per_polarity each of positive
+    and negative grasps. Without the cap, frequently-appearing objects produce
+    1-2 GB JSONs that bottleneck the cache build (~90 s parse per object)."""
     transforms, widths, labels, reasons = [], [], [], []
     gripper_block = None
     for jp in json_paths:
@@ -81,6 +97,21 @@ def merge_grasps(json_paths: list[Path], obj_rel_path: str, source_count: int) -
         reasons.extend(g.get("filter_reasons", [""] * len(g["object_in_gripper"])))
         if gripper_block is None:
             gripper_block = d.get("gripper")
+    # Random-sample down to keep file sizes manageable.
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    labels_arr = np.asarray(labels, dtype=bool)
+    pos_idx = np.where(labels_arr)[0]
+    neg_idx = np.where(~labels_arr)[0]
+    if len(pos_idx) > max_per_polarity:
+        pos_idx = rng.choice(pos_idx, max_per_polarity, replace=False)
+    if len(neg_idx) > max_per_polarity:
+        neg_idx = rng.choice(neg_idx, max_per_polarity, replace=False)
+    keep = np.sort(np.concatenate([pos_idx, neg_idx]))
+    transforms = [transforms[i] for i in keep]
+    widths = [widths[i] for i in keep]
+    labels = [labels[i] for i in keep]
+    reasons = [reasons[i] for i in keep]
     return {
         "object": {"file": obj_rel_path, "scale": 1.0},
         "gripper": gripper_block,
@@ -114,6 +145,8 @@ def main():
                     default=Path("/home/kaelin/bp_runtime/ml_deps/eomt/grasp_finetune_data"))
     ap.add_argument("--val-fraction", type=float, default=VAL_FRACTION)
     ap.add_argument("--seed", type=int, default=SEED)
+    ap.add_argument("--min-positives", type=int, default=MIN_POSITIVES,
+                    help="Drop objects with fewer than this many positive grasps from splits")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would be done without writing files")
     args = ap.parse_args()
@@ -150,6 +183,19 @@ def main():
 
     if skipped:
         log.warning(f"Skipped {len(skipped)} objects (USD load failed): {skipped[:5]}...")
+
+    # Filter objects with too few positives (loader requires sustainable counts
+    # per category for procedural negative sampling).
+    n_before = len(converted)
+    eligible = []
+    for cname in converted:
+        with open(grasp_out_dir / f"{cname}.grasps.json") as f:
+            n_pos = json.load(f)["n_grasps_valid"]
+        if n_pos >= args.min_positives:
+            eligible.append(cname)
+    log.info(f"Filtered {n_before - len(eligible)}/{n_before} objects with <{args.min_positives} positives "
+             f"({len(eligible)} eligible)")
+    converted = eligible
 
     # Object-disjoint split.
     rng = random.Random(args.seed)

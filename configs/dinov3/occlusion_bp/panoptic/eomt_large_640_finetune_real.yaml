@@ -1,0 +1,77 @@
+trainer:
+  # Resume from the epoch=42 ckpt with --ckpt_path; bump max_epochs so the
+  # head-only stage gets headroom on the real data. 45 train frames / bs 2 =
+  # 22 steps/epoch, so 200 epochs ≈ 4400 head-only steps (~30 min on a 5090).
+  max_epochs: 200
+  gradient_clip_val: 1.0
+  precision: 32-true
+  callbacks:
+    # All-frozen-except-heads. Replaces BackboneFreezeCallback for this stage.
+    - class_path: training.head_only_freeze.HeadOnlyFreezeCallback
+      init_args:
+        last_n_blocks: 4   # unfreeze last 4 ViT-L blocks; LLRD keeps their LR
+                           # ~10× below heads (≈5e-6 at the deepest block)
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        save_top_k: 3
+        monitor: epoch
+        mode: max
+        save_last: True
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "iscar_bp_finetune_real_round1_heads_only"
+model:
+  class_path: training.mask_classification_panoptic.MaskClassificationPanoptic
+  init_args:
+    # ckpt_path is the DINOv3 base pretrained — Lightning's --ckpt_path
+    # restores full state on top of this. Leave as-is so model.__init__ has
+    # a valid weights source even if --ckpt_path isn't passed.
+    ckpt_path: "checkpoints/eomt_large_640.bin"
+    num_classes: 2
+    load_ckpt_class_head: False
+    use_area_weighting: True
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [0, 283520, 425280, 567040]
+    attn_mask_annealing_end_steps: [28770, 425280, 567040, 708800]
+    # Head-only stage — disable aux geometry losses entirely (heads frozen,
+    # zero coefficient = zero gradient = zero compute waste).
+    depth_coefficient: 0.0
+    depth_grad_coefficient: 0.0
+    normal_coefficient: 0.0
+    normal_grad_coefficient: 0.0
+    consistency_coefficient: 0.0
+    aux_loss_warmup_steps: 1
+    lr: 5e-5            # 4× below the from-scratch 2e-4 — head-only fine-tune
+    lr_mult: 0.1
+    weight_decay: 0.0
+    llrd_l2_enabled: False
+    warmup_steps: [200, 200]  # short ramp; resume already has warm state
+    backbone_freeze_steps: 0  # HeadOnlyFreezeCallback owns the freezing now
+    delta_weights: True
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        enable_occlusion: True
+        num_q: 200
+        depth_taps: [4, 11, 17, 23]
+        use_intrinsics: true
+        enable_normals: true
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: facebook/dinov3-vitl16-pretrain-lvd1689m
+
+data:
+  class_path: datasets.iscar_bp.ReplicatorDataModule
+  init_args:
+    path: "/home/kaelin/BinPicking/RealDataset/round_001_replicator"
+    stuff_classes: [0]
+    num_classes: 2
+    img_size: [640, 640]
+    batch_size: 2
+    scale_range: [1.0, 1.0]
+    color_jitter_enabled: True
+    num_workers: 4

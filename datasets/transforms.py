@@ -122,15 +122,19 @@ class Transforms(nn.Module):
         # the loss. Avoids contaminating gradients with the constant 0.
         if "depth" in target:
             target["depth"] = F.pad(target["depth"], padding, fill=float("nan"))
+        # Pad normals with 0 — the depth validity mask gates the normal loss,
+        # so padded regions are excluded; the fill value is irrelevant.
+        if "normals" in target:
+            target["normals"] = F.pad(target["normals"], padding, fill=0.0)
 
         return img, target
 
     def _filter(self, target: dict[str, Union[Tensor, TVTensor]], keep: Tensor) -> dict:
-        # `depth` and `intrinsics` are per-image (not per-instance), so the
-        # per-instance `keep` mask doesn't apply. Pass them through unchanged.
+        # `depth`, `normals`, and `intrinsics` are per-image (not per-instance),
+        # so the per-instance `keep` mask doesn't apply. Pass them through.
         out = {}
         for k, v in target.items():
-            if k in ("depth", "intrinsics"):
+            if k in ("depth", "normals", "intrinsics"):
                 out[k] = v
             else:
                 out[k] = wrap(v[keep], like=v)
@@ -167,13 +171,24 @@ class Transforms(nn.Module):
 
         img = self.color_jitter(img)
 
-        # Horizontal flip — done manually so we can update intrinsics.
+        # Horizontal flip — done manually so we can update intrinsics
+        # AND because normals are direction vectors, not just pixels.
         if torch.rand(()) < self.hflip_prob:
             W_before = img.shape[-1]
             img = F.horizontal_flip(img)
             target["masks"] = F.horizontal_flip(target["masks"])
             if "depth" in target:
                 target["depth"] = F.horizontal_flip(target["depth"])
+            if "normals" in target:
+                # Flip the raster (left↔right) AND negate the X-component:
+                # "right" becomes "left" in image coords, so the vector's
+                # X axis must invert. Y and Z (down / fwd) are unchanged.
+                # Preserve the tv_tensors.Mask wrapper via wrap().
+                n_flipped = F.horizontal_flip(target["normals"])
+                sign = torch.tensor([-1.0, 1.0, 1.0],
+                                    dtype=n_flipped.dtype,
+                                    device=n_flipped.device).view(3, 1, 1)
+                target["normals"] = wrap(n_flipped * sign, like=target["normals"])
             if "intrinsics" in target:
                 target["intrinsics"] = self._hflip_intrinsics(
                     target["intrinsics"], W_before
@@ -202,6 +217,8 @@ class Transforms(nn.Module):
         target["masks"] = F.crop(target["masks"], i, j, h, w)
         if "depth" in target:
             target["depth"] = F.crop(target["depth"], i, j, h, w)
+        if "normals" in target:
+            target["normals"] = F.crop(target["normals"], i, j, h, w)
         if "intrinsics" in target:
             target["intrinsics"] = self._crop_intrinsics(
                 target["intrinsics"], ox=j, oy=i

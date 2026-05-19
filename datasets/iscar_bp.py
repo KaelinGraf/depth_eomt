@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 from typing import Union
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 from datasets.lightning_data_module import LightningDataModule
 from datasets.transforms import Transforms
@@ -110,6 +110,23 @@ class ReplicatorDataset(Dataset):
                 depth_arr = depth_arr[None, ...]   # add channel dim → [1, H, W]
             depth = tv_tensors.Mask(torch.from_numpy(depth_arr))
 
+        # 1c. Load per-pixel surface normals (Replicator's `normals` annotator,
+        #     [H,W,4] with channel 3 = constant alpha=1.0). Replicator emits
+        #     OpenGL-style camera-space normals (X right, Y up, Z toward
+        #     camera); flip (1, -1, -1) here to match our OpenCV unprojection
+        #     convention (X right, Y down, Z fwd into scene). After the flip,
+        #     a frontal-facing surface has Z ≈ -1 (normal points toward
+        #     camera, outward from surface). Verified against GT depth via
+        #     `training/depth_loss.py:_selftest_normal_convention` — median
+        #     cosine > 0.94 across val frames.
+        normals_path = frame_dir / "normals.npy"
+        normals = None
+        if normals_path.exists():
+            n_arr = np.load(normals_path)[..., :3].astype(np.float32)      # [H, W, 3]
+            n_arr = n_arr * np.array([1.0, -1.0, -1.0], dtype=np.float32)  # OpenGL→OpenCV
+            n_arr = np.transpose(n_arr, (2, 0, 1))                          # → [3, H, W]
+            normals = tv_tensors.Mask(torch.from_numpy(n_arr))
+
         # 2. Load 16-bit Grayscale Mask. Raw-mask filenames carry a Replicator
         # prefix, so match by pattern. `_is_complete` (ctor) guarantees a hit;
         # the explicit None-check turns any future miss into a clear error
@@ -193,6 +210,8 @@ class ReplicatorDataset(Dataset):
         }
         if depth is not None:
             target["depth"] = depth
+        if normals is not None:
+            target["normals"] = normals
 
         target["intrinsics"] = _parse_intrinsics(scene_info)
 
@@ -277,5 +296,87 @@ class ReplicatorDataModule(LightningDataModule):
         return DataLoader(
             self.val_dataset,
             collate_fn=self.eval_collate, # Inherited from base LightningDataModule
+            **self.dataloader_kwargs,
+        )
+
+class _NoDepthNormalsWrapper:
+    """Wraps a Dataset to strip 'depth' and 'normals' keys from its target
+    dicts. Needed when mixing synth (has depth/normals) with real (doesn't);
+    training_step's `if "depth" in targets[0]` shortcut crashes on the first
+    mixed batch where the leading sample is synth — by stripping synth's
+    extras, the check uniformly fails and the optional aux-loss path is
+    skipped. depth/normals heads still forward (enable_depth/enable_normals
+    are model-side flags) but with coefficients = 0 they contribute nothing."""
+
+    def __init__(self, ds):
+        self._ds = ds
+
+    def __len__(self):
+        return len(self._ds)
+
+    def __getitem__(self, idx):
+        img, target = self._ds[idx]
+        target.pop("depth", None)
+        target.pop("normals", None)
+        return img, target
+
+
+class MixedReplicatorDataModule(ReplicatorDataModule):
+    """Run-2 data module: ConcatDataset(real_train, synth_train) with a
+    WeightedRandomSampler so each epoch's expected sample count is
+    `real_per_epoch` real + `synth_per_epoch` synth (i.e. 2:1 synth:real
+    when called as 45 / 90). Val stays real-only to track in-domain quality."""
+
+    def __init__(self, real_path, synth_path,
+                 real_per_epoch: int = 45, synth_per_epoch: int = 90, **kwargs):
+        # Parent uses `real_path` as the "primary" — its val/ subdir becomes val.
+        super().__init__(path=real_path, **kwargs)
+        self.synth_path = synth_path
+        self.real_per_epoch = int(real_per_epoch)
+        self.synth_per_epoch = int(synth_per_epoch)
+
+    def setup(self, stage=None):
+        if stage in (None, "fit"):
+            real = ReplicatorDataset(
+                data_dir=Path(self.path) / "train", transforms=self.transforms)
+            synth = ReplicatorDataset(
+                data_dir=Path(self.synth_path) / "train", transforms=self.transforms)
+            # Strip depth/normals from synth so target dict shape matches real
+            # (real frames don't have those files — see _NoDepthNormalsWrapper).
+            synth = _NoDepthNormalsWrapper(synth)
+            self.train_dataset = ConcatDataset([real, synth])
+            n_r, n_s = len(real), len(synth)
+            # Item weights: real items at weight 1, synth items at weight
+            # (synth_per_epoch/real_per_epoch) * (n_r/n_s) so that after the
+            # sampler normalises, expected per-epoch draw counts hit the spec.
+            ratio = (self.synth_per_epoch / max(self.real_per_epoch, 1)) * (n_r / max(n_s, 1))
+            weights = [1.0] * n_r + [ratio] * n_s
+            self._sampler = WeightedRandomSampler(
+                weights,
+                num_samples=self.real_per_epoch + self.synth_per_epoch,
+                replacement=True,
+            )
+            bs = self.dataloader_kwargs["batch_size"]
+            logging.info(
+                "MixedReplicatorDataModule: real=%d, synth=%d, "
+                "per-epoch target = %d real + %d synth (%d total = %d steps@bs=%d)",
+                n_r, n_s, self.real_per_epoch, self.synth_per_epoch,
+                self.real_per_epoch + self.synth_per_epoch,
+                (self.real_per_epoch + self.synth_per_epoch) // max(bs, 1),
+                bs,
+            )
+            self.val_dataset = ReplicatorDataset(
+                data_dir=Path(self.path) / "val", transforms=self.val_transforms)
+        return self
+
+    def train_dataloader(self):
+        # Mirror ReplicatorDataModule.train_dataloader but pass sampler instead
+        # of shuffle (mutually exclusive in DataLoader). dataloader_kwargs gives
+        # us batch_size + num_workers + pin_memory + persistent_workers.
+        return DataLoader(
+            self.train_dataset,
+            sampler=self._sampler,
+            drop_last=True,
+            collate_fn=self.train_collate,
             **self.dataloader_kwargs,
         )

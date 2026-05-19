@@ -48,7 +48,8 @@ class EoMTResult:
     query_tokens: np.ndarray       # [num_q, embed_dim] for diffusion conditioning
     raw_masks: np.ndarray          # [N, H, W] per-instance binary masks
     scores: np.ndarray             # [N] confidence scores
-    depth: Optional[np.ndarray] = None  # [H, W] float32 metres, or None if depth head disabled
+    depth: Optional[np.ndarray] = None   # [H, W] float32 metres, or None if depth head disabled
+    normal: Optional[np.ndarray] = None  # [3, H, W] unit normals (OpenCV cam coords), or None
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +367,10 @@ class EoMTInference:
         K = getattr(self, "_scaled_intrinsics", None)
 
         # Forward pass
-        mask_logits_per_layer, class_logits_per_layer, occ_per_layer, depth_pred, query_tokens = self.model(
-            tensor / 255.0,
-            intrinsics=K,
-        )
+        (
+            mask_logits_per_layer, class_logits_per_layer, occ_per_layer,
+            depth_pred, normal_pred, query_tokens,
+        ) = self.model(tensor / 255.0, intrinsics=K)
 
         # Use final layer predictions
         mask_logits = mask_logits_per_layer[-1]
@@ -400,8 +401,21 @@ class EoMTInference:
             )
             depth_np = depth_pred[0, 0].detach().cpu().numpy().astype(np.float32)
 
+        # Same letterbox-crop-resize for the normal map. Bilinear interp
+        # un-normalises the vectors at fractional sample points; renormalise
+        # afterwards so the output is a clean unit-vector field.
+        normal_np = None
+        if normal_pred is not None:
+            normal_pred = normal_pred[:, :, :sh, :sw]
+            normal_pred = F.interpolate(
+                normal_pred, self._original_size, mode="bilinear", align_corners=False
+            )
+            normal_pred = F.normalize(normal_pred, dim=1, eps=1e-8)
+            normal_np = normal_pred[0].detach().cpu().numpy().astype(np.float32)
+
         result = self._postprocess(mask_logits, class_logits, occ_logits, query_tokens)
         result.depth = depth_np
+        result.normal = normal_np
         return result
 
     # -----------------------------------------------------------------------

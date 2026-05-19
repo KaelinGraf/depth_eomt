@@ -30,6 +30,11 @@ class EoMT(nn.Module):
         # disable. Default mirrors DA3's da3mono-large `out_layers`.
         depth_taps: Optional[Sequence[int]] = (4, 11, 17, 23),
         use_intrinsics: bool = True,
+        # Parallel normal-prediction head (Tier 2 of training_plan.md §12).
+        # Reads the SAME taps as the depth head; emits unit normals in OpenCV
+        # camera coords. Implicitly requires `depth_taps is not None` (the
+        # head reuses the tap captures); if depth is off, normals are off.
+        enable_normals: bool = True,
     ):
         super().__init__()
         self.encoder = encoder
@@ -83,12 +88,36 @@ class EoMT(nn.Module):
         # path so the patch embeddings encode geometry — that's the whole
         # point for the downstream flow-matching grasp model.
         self.depth_taps = tuple(depth_taps) if depth_taps else None
+        # Metric-depth output range — sigmoid output rescaled to this band.
+        # Bin scenes have GT ≈ 0.6-0.9 m, max plausible ~2.5 m. Tightened
+        # from 10 → 3 to concentrate sigmoid's gradient near the target:
+        # at logit ~ -1.2 the depth ≈ 0.7 m and sigmoid' ≈ 0.18 (vs 0.06
+        # in the 10 m band) — ~3× faster convergence in the target range.
+        self._depth_min = 0.05
+        self._depth_max = 3.0
         if self.depth_taps is not None:
             self.depth_head = DPT(
                 dim_in=self.encoder.backbone.embed_dim,
                 patch_size=patch_size[0],
                 output_dim=1,
-                activation="exp",
+                # Sigmoid activation — outputs in (0,1), rescaled to metric
+                # range in forward(). Bounded by construction (no overflow
+                # path under fp16), smooth gradient everywhere (no dead
+                # zones), and the model literally cannot predict depth
+                # outside [_depth_min, _depth_max]. This is the *fix* after:
+                # (a) DA3's `exp` activation caused fp16 overflow / blowup,
+                # (b) `clamp(max=20)` post-exp killed gradients above the
+                #     cap and locked the head in saturated state,
+                # (c) `softplus` was bounded only asymptotically-linearly
+                #     and let logits drift to ~30, putting d_pred ~30m.
+                # Sigmoid * (D_MAX - D_MIN) + D_MIN can NEVER exceed D_MAX,
+                # so the model is forced to find the correct scale band.
+                # Note: sigmoid saturates near its bounds (vanishing
+                # gradient at sigmoid(±6) ≈ 0 / 1), so the model can't
+                # spend forever near the extremes — but bin-scene targets
+                # are mid-range (sigmoid(-2.6) ≈ 0.07 ≈ 0.7m on our scale)
+                # where gradient is healthy.
+                activation="sigmoid",
                 features=256,
                 out_channels=(256, 512, 1024, 1024),
                 pos_embed=False,
@@ -97,6 +126,30 @@ class EoMT(nn.Module):
                 use_sky_head=False,
                 # Taps are pre-normed by encoder.backbone.norm in forward(),
                 # matching DA3 mono (get_intermediate_layers in DINOv2).
+                norm_type="idt",
+                fusion_block_inplace=False,
+            )
+
+        # Parallel normal head — reads the same four tap captures as the
+        # depth head, emits a 3-channel unit-vector normal map (OpenCV camera
+        # coords). `predict_conf=False` prevents DPT's legacy `output_dim>1`
+        # path from splitting the last channel off as a confidence map.
+        # `tanh` bounds the raw logits; eomt.forward L2-normalises for unit
+        # length. Gated additionally on `depth_taps is not None`.
+        self.enable_normals = enable_normals and (self.depth_taps is not None)
+        if self.enable_normals:
+            self.normal_head = DPT(
+                dim_in=self.encoder.backbone.embed_dim,
+                patch_size=patch_size[0],
+                output_dim=3,
+                activation="tanh",
+                predict_conf=False,
+                features=256,
+                out_channels=(256, 512, 1024, 1024),
+                pos_embed=False,
+                down_ratio=1,
+                head_name="normal",
+                use_sky_head=False,
                 norm_type="idt",
                 fusion_block_inplace=False,
             )
@@ -316,35 +369,65 @@ class EoMT(nn.Module):
         if self.enable_occlusion:
             occlusion_logits_per_layer.append(occlusion_logits)
 
-        # Run the DPT depth head on the four captured taps. DPT expects
-        # `feats` as a list of 4 entries where `feat[0]` is a [B, S, N, C]
-        # tensor — wrap each tap in a 1-tuple so `feat[0]` returns the
-        # full [B, 1, N_patch, C] tensor.
+        # Run the DPT depth (and parallel normal) head on the four captured
+        # taps. DPT expects `feats` as a list of 4 entries where `feat[0]`
+        # is a [B, S, N, C] tensor — wrap each tap in a 1-tuple so `feat[0]`
+        # returns the full [B, 1, N_patch, C] tensor.
         depth = None
+        normal = None
         if depth_tap_feats is not None:
             ph, pw = self.encoder.backbone.patch_embed.grid_size
             patch_size = self.encoder.backbone.patch_embed.patch_size
             H = ph * patch_size[0]
             W = pw * patch_size[1]
             feats_wrapped = [(t.unsqueeze(1),) for t in depth_tap_feats]  # [B, S=1, N, C]
+
             depth_out = self.depth_head(
-                feats_wrapped,
-                H=H,
-                W=W,
-                patch_start_idx=0,
-                chunk_size=None,
+                feats_wrapped, H=H, W=W, patch_start_idx=0, chunk_size=None,
             )
             depth = depth_out["depth"]  # [B, S=1, H, W] for output_dim=1
             if depth.dim() == 4:
-                # Squeeze the trailing S=1 frame dim → [B, H, W]
-                depth = depth.squeeze(1)
-            # Return [B, 1, H, W] for uniform CHW layout downstream.
-            depth = depth.unsqueeze(1)
+                depth = depth.squeeze(1)            # → [B, H, W]
+            depth = depth.unsqueeze(1)              # → [B, 1, H, W]
+            # Rescale sigmoid output ∈ (0,1) to the metric band
+            # [_depth_min, _depth_max]. By construction this can never go
+            # negative or exceed _depth_max, so SI-Log can't be blown up
+            # by a single divergent pixel. `nan_to_num` remains as a
+            # belt-and-suspenders guard against NaN propagated upstream.
+            depth = self._depth_min + (self._depth_max - self._depth_min) * depth
+            depth = torch.nan_to_num(depth, nan=self._depth_min, posinf=self._depth_max, neginf=self._depth_min)
+
+            if self.enable_normals:
+                normal_out = self.normal_head(
+                    feats_wrapped, H=H, W=W, patch_start_idx=0, chunk_size=None,
+                )
+                normal = normal_out["normal"]       # [B, S=1, 3, H, W]
+                if normal.dim() == 5:
+                    normal = normal.squeeze(1)      # → [B, 3, H, W]
+                # Unit-normalise with a degenerate-safe fallback. The
+                # head's `tanh` bounds logits to [-1,1] per channel, but
+                # the model can collapse to producing all-zero pre-norm
+                # vectors — at that point `F.normalize(0)` returns 0 (or
+                # NaN, then nan_to_num→0), the loss saturates to 1.0, and
+                # the gradient through `F.normalize` at zero is degenerate
+                # so the head can't learn its way out. Catch the near-zero
+                # case BEFORE normalize and substitute a (0,0,1) default
+                # (camera-forward) — most bin-scene pixels have normals
+                # near this anyway, so the fallback contributes a sensible
+                # loss + a non-zero gradient if the model picks up.
+                mag = normal.norm(dim=1, keepdim=True)              # [B, 1, H, W]
+                degenerate = mag < 1e-4
+                normal = normal / mag.clamp_min(1e-8)
+                default_z = torch.zeros_like(normal)
+                default_z[:, 2] = 1.0
+                normal = torch.where(degenerate, default_z, normal)
+                normal = torch.nan_to_num(normal, nan=0.0, posinf=0.0, neginf=0.0)
 
         return (
             mask_logits_per_layer,
             class_logits_per_layer,
             occlusion_logits_per_layer if self.enable_occlusion else None,
-            depth,           # [B, 1, H, W] in metres (post-exp activation), or None
+            depth,           # [B, 1, H, W] post-exp metres, or None
+            normal,          # [B, 3, H, W] unit normals (OpenCV cam coords), or None
             query_tokens,    # [B, num_q, embed_dim] from final block
         )

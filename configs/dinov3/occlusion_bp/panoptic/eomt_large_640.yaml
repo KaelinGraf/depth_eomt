@@ -1,5 +1,32 @@
 trainer:
   max_epochs: 100
+  # Override main.py's trainer_defaults gradient_clip_val=0.01. With 74M
+  # trainable params, an L2 cap of 0.01 across the full vector forces avg
+  # per-param gradient magnitude to ~1.16e-6 — far too tight. Raised to
+  # 1.0 (standard transformer training value).
+  gradient_clip_val: 1.0
+  # Switch from 16-mixed → 32-true to rule out fp16 underflow as the cause
+  # of zero-gradient signal reaching Adam (observed: ||first_moment|| =
+  # 0.0e+00 for all 149 trainable param tensors after 7 epochs, indicating
+  # gradients were never accumulated). fp32 is ~30% slower per step and
+  # ~1.7× more memory but eliminates an entire class of numerical bugs.
+  precision: 32-true
+  callbacks:
+    # Stage-A hard freeze: backbone requires_grad=False until step 70,880
+    # (≈10 epochs @ bs=2, 7,089 steps/epoch). Saves compute and Adam state
+    # while the four re-init'd heads stabilise.
+    - class_path: training.freeze_callback.BackboneFreezeCallback
+      init_args:
+        freeze_steps: 70880
+    # Retain the last 3 epoch checkpoints (instead of Lightning's default
+    # save_top_k=1) so we don't lose a healthy state when training later
+    # corrupts (lost epoch-1 ckpt to an epoch-2 NaN-cascade in a prior run).
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        save_top_k: 3
+        monitor: epoch
+        mode: max
+        save_last: True
   logger:
     class_path: lightning.pytorch.loggers.wandb.WandbLogger
     init_args:
@@ -14,19 +41,55 @@ model:
     load_ckpt_class_head: False
     use_area_weighting: True
     attn_mask_annealing_enabled: True
-    # Derived for the IS monocular_dataset: 14,178 train frames / batch_size 4
-    # = 3544 steps/epoch (drop_last) * 100 epochs = 354,400 total steps.
+    # Derived for the IS monocular_dataset: 14,178 train frames / batch_size 2
+    # = 7,089 steps/epoch (drop_last) * 100 epochs = 708,900 total steps.
     # COCO fractional positions preserved: block-0 anneals over the first
     # ~4% (3000/73910), blocks 1-3 over [40-60%], [60-80%], [80-100%].
-    attn_mask_annealing_start_steps: [0, 141760, 212640, 283520]
-    attn_mask_annealing_end_steps: [14385, 212640, 283520, 354400]
+    attn_mask_annealing_start_steps: [0, 283520, 425280, 567040]
+    attn_mask_annealing_end_steps: [28770, 425280, 567040, 708800]
     lr: 2e-4
+    # DA3 discriminative LR: backbone groups peak at lr * lr_mult = 2e-5,
+    # ~10× below the heads. Honoured by `lightning_module.configure_optimizers`
+    # after the dead-elif fix; with lr_mult=1.0 this is a no-op.
+    lr_mult: 0.1
+    # weight_decay=0 because Stage A's frozen-backbone gradient signal
+    # is so small that AdamW's default wd=0.05 produced uniform
+    # multiplicative shrinkage of ALL trainable params (factor exactly
+    # 0.9364 per epoch, std=0 across param elements ⇒ zero gradient signal
+    # reaching Adam's first moment). Disabling wd halts the shrinkage and
+    # lets any actual gradient (however small) accumulate over time.
+    weight_decay: 0.0
     llrd_l2_enabled: False
-    warmup_steps: [2000, 3000]
+    # warmup_steps = (head_warmup, backbone_ramp). With backbone_freeze_steps
+    # below, the backbone holds at lr=0 for 35,440 steps then ramps over the
+    # second number (8k, matching DA3's 4-%-of-training warmup). Head warmup
+    # stays at 2k.
+    warmup_steps: [2000, 8000]
+    # Stage-A hard freeze: backbone lr=0 for ~10 epochs while the four
+    # re-init'd heads (class, occlusion, depth, intrinsics) stabilise.
+    # 70,880 = 10 × 7,089 steps/epoch (14,178 train frames / bs=2, drop_last).
+    backbone_freeze_steps: 70880
     delta_weights: True
     # Depth head (DA3 mono recipe). Coefficient 1.0 to start; tune if depth
     # gradient dominates the existing mask/class/occlusion losses.
     depth_coefficient: 1.0
+    # Aux geometric losses (training_plan.md §5 + §12). The `_grad` and
+    # `normal*` / `consistency` terms target boundary sharpness — the
+    # "hilly landscape" failure mode seen on epoch-0 depth maps. These are
+    # scaled by `criterion.aux_ramp`, which the LightningModule ramps from
+    # 0 → 1 over `aux_loss_warmup_steps`, so SI-Log + panoptic stabilise
+    # first and the structure terms come in once depth is in a sane ballpark.
+    depth_grad_coefficient: 0.5         # DA-style log-depth ∇ matching
+    # Normal+consistency disabled: the (tanh + F.normalize) parameterisation
+    # has a degenerate (0,0,0) attractor that the model kept collapsing into
+    # despite a (0,0,1) fallback patch, leading to loss pegged at 1.0 → NaN
+    # cascade. Will revisit as a separate exercise once depth + panoptic
+    # converge end-to-end. With coef=0, normal_head receives no gradient
+    # (effectively frozen at re-init) and contributes nothing to loss_total.
+    normal_coefficient: 0.0             # was 0.5 — see above
+    normal_grad_coefficient: 0.0        # was 0.5 — see above
+    consistency_coefficient: 0.0        # was 0.25 — see above
+    aux_loss_warmup_steps: 20000        # ~2.8 epochs at bs=2 / 7089 steps
     network:
       class_path: models.eomt.EoMT
       init_args:
@@ -42,6 +105,12 @@ model:
         # multi-camera deployment). Set to false to drop the intrinsics_mlp
         # entirely and run unconditioned monocular depth (matches da3mono-large).
         use_intrinsics: true
+        # Parallel normal-prediction head (DPT, output_dim=3, tanh + L2-norm).
+        # Reads the SAME taps as the depth head; predicts unit normals in
+        # OpenCV camera coords (X right, Y down, Z fwd). Default in EoMT.__init__
+        # is True; set explicitly here for visibility. Set false to disable
+        # the head entirely (turns off all normal-related losses too).
+        enable_normals: true
         encoder:
           class_path: models.vit.ViT
           init_args:
@@ -54,7 +123,7 @@ data:
     stuff_classes: [0]
     num_classes: 2
     img_size: [640, 640]
-    batch_size: 4
+    batch_size: 2
     # Disable scale jitter: rescaling the image while keeping metric depth
     # values is geometrically inconsistent (DA3 mono training avoids it).
     scale_range: [1.0, 1.0]

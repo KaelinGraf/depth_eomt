@@ -31,6 +31,13 @@ model:
     # Depth head (DA3 mono recipe). Coefficient 1.0 to start; tune if depth
     # gradient dominates the existing mask/class/occlusion losses.
     depth_coefficient: 1.0
+    # Aux geometric losses (training_plan.md §5 + §12), scaled by the
+    # aux_ramp curriculum (linear 0→1 over aux_loss_warmup_steps).
+    depth_grad_coefficient: 0.5
+    normal_coefficient: 0.5
+    normal_grad_coefficient: 0.5
+    consistency_coefficient: 0.25
+    aux_loss_warmup_steps: 40000        # ~2.8 epochs at bs=1 / 14178 steps/epoch
     network:
       class_path: models.eomt.EoMT
       init_args:
@@ -46,6 +53,8 @@ model:
         # multi-camera deployment). Set to false to drop the intrinsics_mlp
         # entirely and run unconditioned monocular depth (matches da3mono-large).
         use_intrinsics: true
+        # Parallel normal-prediction head. See the 640 yaml for details.
+        enable_normals: true
         encoder:
           class_path: models.vit.ViT
           init_args:
